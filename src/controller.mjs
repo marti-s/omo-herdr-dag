@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readdir } from 'node:fs/promises';
+import { readdir, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { readJson, writeJson } from './storage.mjs';
 import { pruneExpiredSnapshots, retentionDaysFromEnv } from './retention.mjs';
@@ -212,6 +212,14 @@ export class DagPane {
     // Record an attempt before mutation: a timeout must not create repeated orphan panes.
     await writeJson(this.recordFile, { attempted: true });
     await this.closeDagPanes();
+    if (this.herdr.launch) {
+      // herdr-core: one terminal runs the viewer; --rm removes it when the viewer quits.
+      const paneId = await this.herdr.launch({ parent: this.parentPane, title: dagTitle(this.sessionId), cwd: this.cwd,
+        argv: [this.node, this.viewer, '--state', this.stateFile] });
+      if (!paneId) throw new Error(t(this.language, 'missingPaneId'));
+      await writeJson(this.recordFile, { paneId, ready: true });
+      return paneId;
+    }
     const result = await this.herdr('split', '--pane', this.parentPane, '--direction', 'right',
       '--ratio', '0.65', '--cwd', this.cwd, '--no-focus');
     const paneId = result?.pane?.pane_id;
@@ -228,6 +236,13 @@ export class DagPane {
     clearTimeout(this.streamTimer);
     this.streams.clear();
     this.taskData.stop();
-    return this.enqueue(() => this.save(false));
+    return this.enqueue(async () => {
+      await this.save(false);
+      // A herdr-core viewer outlives its session's terminal; close it with the session.
+      if (!this.herdr.launch) return;
+      const record = await readJson(this.recordFile);
+      if (record?.paneId) await this.closePane(record.paneId);
+      await rm(this.recordFile, { force: true });
+    });
   }
 }

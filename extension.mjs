@@ -3,13 +3,14 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFileSync } from 'node:fs';
 import { DagPane } from './src/controller.mjs';
-import { createHerdr, herdrSession } from './src/herdr.mjs';
+import { createHc, createHerdr, hcSession, herdrSession } from './src/herdr.mjs';
 import { resolveViewerNode } from './src/runtime.mjs';
 import { tapStreams } from './src/stream-tap.mjs';
 import { t, languageOf } from './src/i18n.mjs';
 
 export default function extension(pi) {
-  if (!herdrSession()) return;
+  const herdr = herdrSession();
+  if (!herdr && !hcSession()) return;
   let installedLanguage = 'en';
   try { installedLanguage = JSON.parse(readFileSync(new URL('./locale.json', import.meta.url), 'utf8')).language; }
   catch (error) { if (error.code !== 'ENOENT') console.warn(`DAG pane: Cannot read locale configuration: ${error.message}`); }
@@ -34,8 +35,9 @@ export default function extension(pi) {
     // In-process child agents inherit the parent pane environment, but do not own its UI.
     if (/[/\\]senpi-task[/\\]children[/\\]/.test(ctx.sessionManager.getSessionFile?.() ?? '')) return;
     controller = new DagPane({ sessionId: ctx.sessionManager.getSessionId(),
-      parentPane: process.env.HERDR_PANE_ID, socket: process.env.HERDR_SOCKET_PATH,
-      stateDir, cwd: pi.cwd, node: () => resolveViewerNode({ language }), viewer, herdr: createHerdr(), language,
+      parentPane: herdr ? process.env.HERDR_PANE_ID : process.env.HC_TERMINAL_ID,
+      socket: herdr ? process.env.HERDR_SOCKET_PATH : process.env.HC_TERMINAL_SOCKET,
+      stateDir, cwd: pi.cwd, node: () => resolveViewerNode({ language }), viewer, herdr: herdr ? createHerdr() : createHc(), language,
       taskStateDir: process.env.OMO_HERDR_DAG_TASK_STATE_DIR,
       notify: message => ctx.ui.notify(message, 'warning') });
     const owner = controller;
