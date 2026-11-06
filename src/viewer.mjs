@@ -130,7 +130,7 @@ async function close(closePane = false) {
 }
 process.stdin.on('keypress', (text, pressed) => {
   if (closing) return;
-  const key = !pressed.ctrl && !pressed.meta && ARROWS[pressed.name] || pressed.sequence || pressed.name || text;
+  const key = !pressed.ctrl && !pressed.meta && !pressed.shift && ARROWS[pressed.name] || pressed.sequence || pressed.name || text;
   if (key === 'q' || key === '\x03' || key === '\x04') return void close(true);
   if (key === 'f') {
     follow = !follow; revealSelection = false;

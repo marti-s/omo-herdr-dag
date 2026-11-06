@@ -439,19 +439,29 @@ test('start reconciles stale snapshots of dead sessions before restoring', async
   assert.equal(state.runs[0].status, 'cancelled');
 });
 
-test('herdr-core: a session the window does not show yet gets its viewer on a later update, not a guessed tab', async t => {
-  const { controller, herdr, launches } = await coreSetup(t);
+test('herdr-core: a session the window does not show yet is retried with back-off, never in a guessed tab', async t => {
+  const { options, herdr, controllers, launches } = await coreSetup(t);
+  let clock = 1_000_000, shown = false, attempts = 0;
   const launch = herdr.launch;
-  let shown = false;
-  herdr.launch = async options => {
-    if (!shown) { launch.calls = (launch.calls ?? 0) + 1; throw new Error('parent_not_shown: the window does not show t0 yet'); }
-    return launch(options);
+  herdr.launch = async launchOptions => {
+    attempts++;
+    if (!shown) throw new Error('parent_not_shown: the window does not show t0 yet');
+    return launch(launchOptions);
   };
+  const controller = new DagPane({ ...options, herdr, now: () => clock });
+  controllers.add(controller);
   await controller.receive(payload());
-  assert.equal(launches().length, 0);
+  await controller.receive(payload());
+  assert.equal(attempts, 1, 'saves inside the back-off window do not retry');
   assert.equal(await readJson(controller.recordFile), null);
-  shown = true;
+  clock += 2001;
   await controller.receive(payload());
+  assert.equal(attempts, 2);
+  await controller.receive(payload());
+  assert.equal(attempts, 2, 'the back-off doubles');
+  shown = true;
+  await controller.open();
+  assert.equal(attempts, 3, '/dag-pane bypasses the back-off');
   assert.equal(launches().length, 1);
   assert.equal((await readJson(controller.recordFile)).paneId, 't1');
 });

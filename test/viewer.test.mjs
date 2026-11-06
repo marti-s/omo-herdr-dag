@@ -587,7 +587,8 @@ test('left and right step through every run in both CSI and application-cursor f
   await viewer.frame(shows('R1', 1, 3));
   // Completed runs are reachable without expanding them first; SS3 and CSI arrows act alike.
   await viewer.frame(text => shows('R2', 2, 3)(text) && text.includes(messages.en.followOff), () => viewer.send({ keys: '\x1bOC' }));
-  await viewer.frame(shows('R3', 3, 3), () => viewer.send({ keys: '\x1b[C' }));
+  // Shift-right is not a run step: with it counted, this would wrap to run 1.
+  await viewer.frame(shows('R3', 3, 3), () => viewer.send({ keys: '\x1b[1;2C\x1b[C' }));
   await viewer.frame(shows('R1', 1, 3), () => viewer.send({ keys: '\x1bOC' }));
   await viewer.frame(shows('R3', 3, 3), () => viewer.send({ keys: '\x1bOD' }));
   await viewer.frame(shows('R2', 2, 3), () => viewer.send({ keys: '\x1b[D' }));

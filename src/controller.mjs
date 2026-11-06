@@ -27,7 +27,7 @@ function missingPane(error) {
 }
 
 export class DagPane {
-  constructor({ sessionId, parentPane, socket, stateDir, cwd, node, viewer, herdr, notify = () => {}, language = 'en', taskStateDir, retentionDays, streamDelay = 250 }) {
+  constructor({ sessionId, parentPane, socket, stateDir, cwd, node, viewer, herdr, notify = () => {}, language = 'en', taskStateDir, retentionDays, streamDelay = 250, now = Date.now }) {
     Object.assign(this, { sessionId, parentPane, stateDir, cwd, node, viewer, herdr, notify });
     this.language = languageOf(language);
     this.key = viewKey(socket, parentPane, sessionId);
@@ -37,6 +37,8 @@ export class DagPane {
     // Explicit option wins so tests need not mutate the shared process environment.
     this.retentionDays = retentionDays ?? retentionDaysFromEnv();
     this.streamDelay = streamDelay;
+    this.now = now;
+    this.notShownUntil = 0;
     this.queue = Promise.resolve();
     this.runs = [];
     this.stopped = false;
@@ -231,6 +233,8 @@ export class DagPane {
     }
     // A viewer closed (or a launch failed) during this run stays closed until a new run or /dag-pane.
     if (record && !force && record.runId === runId) { this.settledRun = runId; return record.paneId; }
+    // A window that does not show this session is retried with back-off, not on every save.
+    if (!force && this.notShownUntil > this.now()) return null;
     if (typeof this.node === 'function') this.node = await this.node();
     // Record an attempt before mutation: a timeout must not create repeated orphan viewers.
     await writeJson(this.recordFile, { attempted: true, runId });
@@ -243,12 +247,15 @@ export class DagPane {
       // The window does not show this session yet: retry on the next save instead of guessing a tab.
       if (/parent_not_shown/.test(error.message)) {
         await rm(this.recordFile, { force: true });
+        this.notShownDelay = Math.min((this.notShownDelay ?? 1000) * 2, 300000);
+        this.notShownUntil = this.now() + this.notShownDelay;
         if (force) this.notify(t(this.language, 'notShown'));
         return null;
       }
       throw error;
     }
     this.settledRun = runId;
+    this.notShownDelay = undefined; this.notShownUntil = 0;
     if (!paneId) throw new Error(t(this.language, 'missingPaneId'));
     await writeJson(this.recordFile, { paneId, ready: true, runId });
     return paneId;
