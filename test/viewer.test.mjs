@@ -575,6 +575,29 @@ test('a following viewer switches to a newly started run before any of its nodes
   await viewer.close();
 });
 
+test('left and right step through every run in both CSI and application-cursor forms; f follows again', { timeout: 20000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dag-arrows-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'session.json');
+  const run = (id, status) => ({ id, name: `${id}_RUN`, status, nodes: [{ id: 'a', label: `${id}_NODE`, state: status }], edges: [] });
+  const state = { sessionId: 'arrows-session', language: 'en', connected: true, runs: [run('R1', 'running'), run('R2', 'completed'), run('R3', 'completed')], tasks: [] };
+  await writeJson(file, state);
+  const viewer = openViewer(file, t);
+  const shows = (name, index, count) => text => text.includes(`Selected run: ${name}_RUN · Run ${index} of ${count}`);
+  await viewer.frame(shows('R1', 1, 3));
+  // Completed runs are reachable without expanding them first; SS3 and CSI arrows act alike.
+  await viewer.frame(text => shows('R2', 2, 3)(text) && text.includes(messages.en.followOff), () => viewer.send({ keys: '\x1bOC' }));
+  await viewer.frame(shows('R3', 3, 3), () => viewer.send({ keys: '\x1b[C' }));
+  await viewer.frame(shows('R1', 1, 3), () => viewer.send({ keys: '\x1bOC' }));
+  await viewer.frame(shows('R3', 3, 3), () => viewer.send({ keys: '\x1bOD' }));
+  await viewer.frame(shows('R2', 2, 3), () => viewer.send({ keys: '\x1b[D' }));
+  // A newer run does not take the chosen run away until follow is switched back on.
+  state.runs = [run('R0', 'running'), ...state.runs];
+  await viewer.frame(shows('R2', 3, 4), () => writeJson(file, state));
+  await viewer.frame(text => shows('R0', 1, 4)(text) && text.includes(messages.en.followOn), () => viewer.send({ keys: 'f' }));
+  await viewer.close();
+});
+
 test('real viewer clock advances elapsed without new snapshots or input', { timeout: 15000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dag-clock-'));
   t.after(() => rm(dir, { recursive: true, force: true }));

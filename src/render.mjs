@@ -308,7 +308,9 @@ export function renderFrame(state, { columns = 54, rows = 48, runIndex = 0, scro
   const activeRuns = all.filter(candidate => candidate.status === 'running' || candidate.nodes.some(node => node.state === 'running'));
   const completedRuns = all.filter(candidate => !activeRuns.includes(candidate));
   const head = [paint(fit(`OMO  /  ${tasksView ? t(language, 'tasks') : 'DAG'}${switcher}`, columns), accent, color),
-    fit(tasksView ? tasksTitle : `${t(language, 'selectedRun', { name: run.name })} · ${t(language, 'activeRuns', { count: activeRuns.length })}`, columns)];
+    fit(tasksView ? tasksTitle : [t(language, 'selectedRun', { name: run.name }),
+      ...(all.length > 1 ? [t(language, 'runPosition', { index: all.indexOf(run) + 1, count: all.length })] : []),
+      t(language, 'activeRuns', { count: activeRuns.length })].join(' · '), columns)];
   const body = [], nodeRanges = Object.create(null), taskRanges = Object.create(null), graphRanges = Object.create(null);
   if (error) body.push(t(language, 'readError', { error: clean(error) }), t(language, 'keepLast'), '');
   if (tasksView && (roots.length || all.length)) {

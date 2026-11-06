@@ -17,8 +17,8 @@ let viewState = emptyViewState(state?.sessionId), viewError = '', saving = Promi
 const selectedNodes = new Map();
 let revealSelection = false, verbose = false, detailSelection, completedExpanded = false;
 let follow = true, target;
-function isActive(run) { return run.status === 'running' || run.nodes.some(node => node.state === 'running'); }
-function selectableRuns() { return (state?.runs ?? []).filter(run => isActive(run) || completedExpanded); }
+// Arrow keys arrive as CSI (ESC [ C) or, in application-cursor mode, SS3 (ESC O C); both parse to one name.
+const ARROWS = { up: '\x1b[A', down: '\x1b[B', right: '\x1b[C', left: '\x1b[D' };
 async function restorePreferences() {
   try { viewState = await loadViewState(file, state?.sessionId); viewError = ''; }
   catch (cause) { viewState = emptyViewState(state?.sessionId); viewError = cause.message; }
@@ -68,7 +68,8 @@ async function refresh() {
       // A newly started run takes over the view while following, even before its first node runs.
       const newRun = follow && next.runs?.[0]?.id && next.runs[0].id !== state?.runs?.[0]?.id;
       state = next; error = '';
-      if (newRun && !sessionChanged) { selectedId = state.runs[0].id; view = 'dag'; scroll = 0; target = undefined; }
+      // The running target still decides the view; a new run only becomes the selected run.
+      if (newRun && !sessionChanged) { selectedId = state.runs[0].id; if (view === 'dag') scroll = 0; }
       if (sessionChanged) {
         await saving; selectedNodes.clear(); selectedTaskId = undefined; scroll = 0;
         selectedId = state?.runs?.[0]?.id; completedExpanded = false;
@@ -129,9 +130,13 @@ async function close(closePane = false) {
 }
 process.stdin.on('keypress', (text, pressed) => {
   if (closing) return;
-  const key = pressed.sequence || pressed.name || text;
+  const key = !pressed.ctrl && !pressed.meta && ARROWS[pressed.name] || pressed.sequence || pressed.name || text;
   if (key === 'q' || key === '\x03' || key === '\x04') return void close(true);
-  if (key === 'f') { follow = !follow; revealSelection = false; }
+  if (key === 'f') {
+    follow = !follow; revealSelection = false;
+    // Following again means the newest run, not the run that was followed before the person chose one.
+    if (follow && state?.runs?.length) { target = undefined; selectedId = state.runs[0].id; view = 'dag'; scroll = 0; }
+  }
   if (['\x1b[B', 'j', '\x1b[A', 'k', '\x1b[6~', '\x1b[5~'].includes(key)) {
     follow = false; revealSelection = false;
   }
@@ -151,7 +156,8 @@ process.stdin.on('keypress', (text, pressed) => {
   }
   if (key === '\x1b[C' || key === '\x1b[D') {
     follow = false;
-    const runs = selectableRuns();
+    // Every run of the session, completed ones included; the header shows which one of how many.
+    const runs = state?.runs ?? [];
     const current = Math.max(0, runs.findIndex(run => run.id === selectedId));
     selectedId = runs[(current + (key === '\x1b[C' ? 1 : -1) + runs.length) % runs.length]?.id;
     if (runs.length) view = 'dag';
