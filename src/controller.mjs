@@ -3,6 +3,7 @@ import { readdir, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { readJson, writeJson } from './storage.mjs';
 import { pruneExpiredSnapshots, retentionDaysFromEnv } from './retention.mjs';
+import { reconcileStaleState } from './reconcile.mjs';
 import { shellCommand } from './herdr.mjs';
 import { normalizeRun, sessionRuns } from './model.mjs';
 import { t, languageOf } from './i18n.mjs';
@@ -26,7 +27,7 @@ function missingPane(error) {
 }
 
 export class DagPane {
-  constructor({ sessionId, parentPane, socket, stateDir, cwd, node, viewer, herdr, notify = () => {}, language = 'en', taskStateDir, retentionDays, streamDelay = 250 }) {
+  constructor({ sessionId, parentPane, socket, stateDir, cwd, node, viewer, herdr, notify = () => {}, language = 'en', taskStateDir, retentionDays, streamDelay = 250, now = Date.now }) {
     Object.assign(this, { sessionId, parentPane, stateDir, cwd, node, viewer, herdr, notify });
     this.language = languageOf(language);
     this.key = viewKey(socket, parentPane, sessionId);
@@ -36,6 +37,8 @@ export class DagPane {
     // Explicit option wins so tests need not mutate the shared process environment.
     this.retentionDays = retentionDays ?? retentionDaysFromEnv();
     this.streamDelay = streamDelay;
+    this.now = now;
+    this.notShownUntil = 0;
     this.queue = Promise.resolve();
     this.runs = [];
     this.stopped = false;
@@ -67,6 +70,16 @@ export class DagPane {
       await pruneExpiredSnapshots(this.stateDir, {
         keepFiles: [basename(this.stateFile), basename(this.recordFile), `${basename(this.stateFile)}.view.json`],
         days: this.retentionDays, notify: message => this.notify(t(this.language, 'pruneFailed', { error: message })) });
+      // Snapshots left connected by a dead session must not look live to their viewers.
+      try {
+        const { errors } = await reconcileStaleState(this.stateDir);
+        for (const { file, error } of errors) this.notify(`DAG pane: Cannot reconcile ${file}: ${error.message}`);
+      } catch (error) { this.notify(`DAG pane: Cannot reconcile stale state: ${error.message}`); }
+      // Viewers of an older install carry no omo.dag labels; replace the ones showing this session.
+      if (this.herdr.legacy) {
+        try { for (const id of await this.herdr.legacy(this.stateFile)) await this.closePane(id); }
+        catch (error) { this.notify(`DAG pane: ${error.message}`); }
+      }
       const state = await readJson(this.stateFile);
       if (state?.sessionId === this.sessionId) {
         this.runs = state.runs ?? [];
@@ -144,7 +157,7 @@ export class DagPane {
 
   async save(connected, refresh = true) {
     if (refresh) this.tasks = await this.taskData.refresh(this.runs);
-    await writeJson(this.stateFile, { version: 1, sessionId: this.sessionId, connected, language: this.language,
+    await writeJson(this.stateFile, { version: 1, sessionId: this.sessionId, connected, owner: { pid: process.pid }, language: this.language,
       updatedAt: new Date().toISOString(), runs: this.runs, tasks: this.withStreams(this.tasks, connected) });
     // All callers serialize saves through the queue, including task-only disk changes.
     if (connected && !this.stopped && (this.runs.length || this.tasks.length)) await this.ensure(false);
@@ -191,7 +204,65 @@ export class DagPane {
     }
   }
 
+  // herdr-core viewers are identified by their omo.dag.session label, never by title.
+  async sessionViewers() {
+    try {
+      return ((await this.herdr('list'))?.panes ?? [])
+        .filter(pane => pane.session === this.sessionId && pane.pane_id).map(pane => pane.pane_id);
+    } catch (error) {
+      this.notify(`DAG pane: ${error.message}`);
+      return [];
+    }
+  }
+
+  async isLive(paneId) {
+    try { await this.herdr('get', paneId); return true; }
+    catch (error) { if (missingPane(error)) return false; throw error; }
+  }
+
+  async ensureViewer(force) {
+    const record = await readJson(this.recordFile);
+    const runId = this.runs[0]?.id ?? null;
+    // Saves run on every stream flush: once this run's viewer is settled, they need no hc calls.
+    if (!force && record && record.runId === runId && this.settledRun === runId) return record.paneId;
+    if (record?.paneId && await this.isLive(record.paneId)) {
+      for (const id of await this.sessionViewers()) if (id !== record.paneId) await this.closePane(id);
+      if (record.runId !== runId) await writeJson(this.recordFile, { ...record, runId });
+      this.settledRun = runId;
+      return record.paneId;
+    }
+    // A viewer closed (or a launch failed) during this run stays closed until a new run or /dag-pane.
+    if (record && !force && record.runId === runId) { this.settledRun = runId; return record.paneId; }
+    // A window that does not show this session is retried with back-off, not on every save.
+    if (!force && this.notShownUntil > this.now()) return null;
+    if (typeof this.node === 'function') this.node = await this.node();
+    // Record an attempt before mutation: a timeout must not create repeated orphan viewers.
+    await writeJson(this.recordFile, { attempted: true, runId });
+    for (const id of await this.sessionViewers()) await this.closePane(id);
+    let paneId;
+    try {
+      paneId = await this.herdr.launch({ parent: this.parentPane, sessionId: this.sessionId, cwd: this.cwd,
+        argv: [this.node, this.viewer, '--state', this.stateFile, '--owner-pid', String(process.pid)] });
+    } catch (error) {
+      // The window does not show this session yet: retry on the next save instead of guessing a tab.
+      if (/parent_not_shown/.test(error.message)) {
+        await rm(this.recordFile, { force: true });
+        this.notShownDelay = Math.min((this.notShownDelay ?? 1000) * 2, 300000);
+        this.notShownUntil = this.now() + this.notShownDelay;
+        if (force) this.notify(t(this.language, 'notShown'));
+        return null;
+      }
+      throw error;
+    }
+    this.settledRun = runId;
+    this.notShownDelay = undefined; this.notShownUntil = 0;
+    if (!paneId) throw new Error(t(this.language, 'missingPaneId'));
+    await writeJson(this.recordFile, { paneId, ready: true, runId });
+    return paneId;
+  }
+
   async ensure(force) {
+    if (this.herdr.launch) return this.ensureViewer(force);
     const record = await readJson(this.recordFile);
     // Preserve a manually closed pane across events/reloads. /dag-pane explicitly reopens it.
     if (record && !force) return record.paneId;
@@ -212,14 +283,6 @@ export class DagPane {
     // Record an attempt before mutation: a timeout must not create repeated orphan panes.
     await writeJson(this.recordFile, { attempted: true });
     await this.closeDagPanes();
-    if (this.herdr.launch) {
-      // herdr-core: one terminal runs the viewer; --rm removes it when the viewer quits.
-      const paneId = await this.herdr.launch({ parent: this.parentPane, title: dagTitle(this.sessionId), cwd: this.cwd,
-        argv: [this.node, this.viewer, '--state', this.stateFile] });
-      if (!paneId) throw new Error(t(this.language, 'missingPaneId'));
-      await writeJson(this.recordFile, { paneId, ready: true });
-      return paneId;
-    }
     const result = await this.herdr('split', '--pane', this.parentPane, '--direction', 'right',
       '--ratio', '0.65', '--cwd', this.cwd, '--no-focus');
     const paneId = result?.pane?.pane_id;
@@ -241,7 +304,9 @@ export class DagPane {
       // A herdr-core viewer outlives its session's terminal; close it with the session.
       if (!this.herdr.launch) return;
       const record = await readJson(this.recordFile);
-      if (record?.paneId) await this.closePane(record.paneId);
+      const viewers = new Set(await this.sessionViewers());
+      if (record?.paneId) viewers.add(record.paneId);
+      for (const id of viewers) await this.closePane(id);
       await rm(this.recordFile, { force: true });
     });
   }

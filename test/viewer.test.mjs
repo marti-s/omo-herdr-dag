@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -278,12 +278,19 @@ finally:
   os.close(master)
 `;
 
-function openViewer(file, t) {
+// A viewer under test must never reach the real herdr-core or window: the test runner's own
+// HC_TERMINAL_ID is the agent running the tests, and closing it would kill that agent.
+function isolatedEnv(overrides = {}) {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(HC_|HERDR_)/.test(key)));
+  return { ...env, HC_BIN_PATH: '/nonexistent/herdr-core', HC_APP_BIN_PATH: '/nonexistent/herdr-app', HERDR_BIN_PATH: '/nonexistent/herdr', ...overrides };
+}
+
+function openViewer(file, t, extraArgs = [], env = isolatedEnv()) {
   const events = new EventEmitter();
-  const viewerArgs = [fileURLToPath(new URL('../src/viewer.mjs', import.meta.url)), '--state', file];
+  const viewerArgs = [fileURLToPath(new URL('../src/viewer.mjs', import.meta.url)), '--state', file, ...extraArgs];
   const child = process.platform === 'win32'
-    ? spawn(process.execPath, [fileURLToPath(new URL('./windows-pty.mjs', import.meta.url)), ...viewerArgs], { stdio: ['pipe', 'pipe', 'pipe'] })
-    : spawn('python3', ['-u', '-c', bridge, process.execPath, ...viewerArgs], { stdio: ['pipe', 'pipe', 'pipe'] });
+    ? spawn(process.execPath, [fileURLToPath(new URL('./windows-pty.mjs', import.meta.url)), ...viewerArgs], { stdio: ['pipe', 'pipe', 'pipe'], env })
+    : spawn('python3', ['-u', '-c', bridge, process.execPath, ...viewerArgs], { stdio: ['pipe', 'pipe', 'pipe'], env });
   let buffer = '', stderr = '', lastFrame = '';
   child.stderr.on('data', data => { stderr += data; });
   child.stdout.setEncoding('utf8');
@@ -312,7 +319,7 @@ function openViewer(file, t) {
       Promise.resolve().then(action).catch(finish);
     });
   }
-  return { frame, send, async close() {
+  return { frame, send, child, async close() {
     const exited = once(child, 'exit', { signal: AbortSignal.timeout(5000) });
     send({ keys: 'q' });
     assert.equal((await exited)[0], 0, stderr);
@@ -514,6 +521,81 @@ test('real PTY follows empty/task/DAG transitions, keeps a running task on paral
   await viewer.frame(text => text.includes('RETURNED_TASK') && text.includes(messages['zh-cn'].followOff), () => writeJson(file, state));
   state.connected = true;
   await viewer.frame(text => text.includes('RETURNED_TASK') && text.includes(messages['zh-cn'].followOn), () => writeJson(file, state));
+  await viewer.close();
+});
+
+test('real viewer exits when the --owner-pid process is gone', { timeout: 15000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dag-owner-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'session.json');
+  await writeJson(file, { sessionId: 'owner-session', connected: true, runs: [], tasks: [{ id: 'x', status: 'completed', description: 'OWNER_TASK' }] });
+  const owner = spawn(process.execPath, ['-e', 'process.stdin.resume()'], { stdio: ['pipe', 'ignore', 'ignore'] });
+  await once(owner, 'spawn');
+  const viewer = openViewer(file, t, ['--owner-pid', String(owner.pid)]);
+  await viewer.frame(text => text.includes('OWNER_TASK'));
+  const ownerExited = once(owner, 'exit');
+  const viewerExited = once(viewer.child, 'exit', { signal: AbortSignal.timeout(8000) });
+  owner.stdin.end();
+  await ownerExited;
+  assert.equal((await viewerExited)[0], 0);
+});
+
+test('a quitting viewer closes its hc terminal only when that terminal is its own labelled viewer', { timeout: 20000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dag-self-close-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'session.json'), log = join(dir, 'calls.jsonl'), hc = join(dir, 'herdr-core');
+  await writeJson(file, { sessionId: 'self-session', connected: true, runs: [], tasks: [{ id: 'x', status: 'completed', description: 'SELF_TASK' }] });
+  // Fake hc: logs each call; `get` answers with the labels from FAKE_LABELS.
+  await writeFile(hc, `#!${process.execPath}\nconst fs = require('node:fs');\nconst [command, , address] = process.argv.slice(2);\n` +
+    `fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify([command, address]) + '\\n');\n` +
+    `console.log(JSON.stringify(command === 'get' ? { address, state: 'live', labels: JSON.parse(process.env.FAKE_LABELS) } : {}));\n`);
+  await chmod(hc, 0o755);
+  const calls = async () => (await readFile(log, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line)[0]);
+  for (const [labels, closes] of [[{}, false], [{ 'omo.dag': 'viewer', 'omo.dag.session': 'other' }, false],
+    [{ 'omo.dag': 'viewer', 'omo.dag.session': 'self-session' }, true]]) {
+    await rm(log, { force: true });
+    const viewer = openViewer(file, t, [], isolatedEnv({ HC_TERMINAL_ID: 't0', HC_BIN_PATH: hc, FAKE_LABELS: JSON.stringify(labels) }));
+    await viewer.frame(text => text.includes('SELF_TASK'));
+    await viewer.close();
+    assert.equal((await calls()).includes('kill'), closes, JSON.stringify(labels));
+  }
+});
+
+test('a following viewer switches to a newly started run before any of its nodes runs', { timeout: 15000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dag-newest-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'session.json');
+  const run = (id, name, status) => ({ id, name, status, nodes: [{ id: 'a', label: `${name}_NODE`, state: status === 'running' ? 'pending' : status }], edges: [] });
+  const state = { sessionId: 'newest-session', connected: true, runs: [run('r1', 'OLD_RUN', 'completed')], tasks: [] };
+  await writeJson(file, state);
+  const viewer = openViewer(file, t);
+  await viewer.frame(text => text.includes('OLD_RUN'));
+  state.runs = [run('r2', 'NEW_RUN', 'running'), ...state.runs];
+  await viewer.frame(text => text.includes('NEW_RUN_NODE'), () => writeJson(file, state));
+  await viewer.close();
+});
+
+test('left and right step through every run in both CSI and application-cursor forms; f follows again', { timeout: 20000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dag-arrows-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'session.json');
+  const run = (id, status) => ({ id, name: `${id}_RUN`, status, nodes: [{ id: 'a', label: `${id}_NODE`, state: status }], edges: [] });
+  const state = { sessionId: 'arrows-session', language: 'en', connected: true, runs: [run('R1', 'running'), run('R2', 'completed'), run('R3', 'completed')], tasks: [] };
+  await writeJson(file, state);
+  const viewer = openViewer(file, t);
+  const shows = (name, index, count) => text => text.includes(`Selected run: ${name}_RUN · Run ${index} of ${count}`);
+  await viewer.frame(shows('R1', 1, 3));
+  // Completed runs are reachable without expanding them first; SS3 and CSI arrows act alike.
+  await viewer.frame(text => shows('R2', 2, 3)(text) && text.includes(messages.en.followOff), () => viewer.send({ keys: '\x1bOC' }));
+  // Shift-right is not a run step: with it counted, this would wrap to run 1.
+  await viewer.frame(shows('R3', 3, 3), () => viewer.send({ keys: '\x1b[1;2C\x1b[C' }));
+  await viewer.frame(shows('R1', 1, 3), () => viewer.send({ keys: '\x1bOC' }));
+  await viewer.frame(shows('R3', 3, 3), () => viewer.send({ keys: '\x1bOD' }));
+  await viewer.frame(shows('R2', 2, 3), () => viewer.send({ keys: '\x1b[D' }));
+  // A newer run does not take the chosen run away until follow is switched back on.
+  state.runs = [run('R0', 'running'), ...state.runs];
+  await viewer.frame(shows('R2', 3, 4), () => writeJson(file, state));
+  await viewer.frame(text => shows('R0', 1, 4)(text) && text.includes(messages.en.followOn), () => viewer.send({ keys: 'f' }));
   await viewer.close();
 });
 

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import { EventEmitter, once } from 'node:events';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +9,7 @@ import { DagPane, dagTitle, isDagViewerPane } from '../src/controller.mjs';
 import { readJson, writeJson } from '../src/storage.mjs';
 import { payload, sessionId } from './fixtures.mjs';
 import { normalizeRun } from '../src/model.mjs';
+import { messages } from '../src/i18n.mjs';
 
 async function setup(t) {
   const stateDir = await mkdtemp(join(tmpdir(), 'omo-dag-test-'));
@@ -344,4 +346,156 @@ test('task-only events update snapshots; reload restores completed details witho
   assert.deepEqual((await readJson(reloaded.stateFile)).tasks, snapshot.tasks);
   await reloaded.stop();
   assert.equal((await readJson(reloaded.stateFile)).connected, false);
+});
+
+// herdr-core: an in-memory fake with launch(); list() reports each viewer's omo.dag.session label.
+function coreHerdr() {
+  const viewers = new Map(), calls = [];
+  let number = 0;
+  const herdr = Object.assign(async (command, ...args) => {
+    calls.push([command, ...args]);
+    if (command === 'list') return { panes: [...viewers].map(([pane_id, session]) => ({ pane_id, session, label: dagTitle(session) })) };
+    if (command === 'get') { if (!viewers.has(args[0])) throw new Error('pane_not_found'); return { address: args[0], state: 'live' }; }
+    if (command === 'close') { if (!viewers.delete(args[0])) throw new Error('pane_not_found'); return {}; }
+    throw new Error(`unsupported ${command}`);
+  }, { launch: async options => { calls.push(['launch', options]); const address = `t${++number}`; viewers.set(address, options.sessionId); return address; } });
+  return { herdr, viewers, calls, launches: () => calls.filter(call => call[0] === 'launch') };
+}
+async function coreSetup(t) {
+  const base = await setup(t);
+  const fake = coreHerdr();
+  const controller = new DagPane({ ...base.options, herdr: fake.herdr });
+  base.controllers.add(controller);
+  return { ...base, ...fake, controller };
+}
+// Same 8-char prefix as the fixture session: only the full id tells them apart.
+const otherSession = `${sessionId}-other`;
+function withNewerRun() {
+  const dag = payload();
+  dag.runs.push({ ...structuredClone(dag.runs[0]), run_id: 'dag_newer', created_at: '2026-09-06T07:00:00Z' });
+  return dag;
+}
+
+test('herdr-core: repeated updates launch one labelled viewer and record the owner', async t => {
+  const { controller, launches, options } = await coreSetup(t);
+  await Promise.all(Array.from({ length: 8 }, () => controller.receive(payload())));
+  await controller.receive(payload());
+  assert.equal(launches().length, 1);
+  assert.deepEqual(launches()[0][1], { parent: options.parentPane, sessionId, cwd: options.cwd,
+    argv: [options.node, options.viewer, '--state', controller.stateFile, '--owner-pid', String(process.pid)] });
+  assert.deepEqual((await readJson(controller.stateFile)).owner, { pid: process.pid });
+  assert.deepEqual(await readJson(controller.recordFile), { paneId: 't1', ready: true, runId: 'dag_demo' });
+});
+
+test('herdr-core: duplicates of the same session close, other sessions stay untouched', async t => {
+  const { controller, viewers, launches } = await coreSetup(t);
+  viewers.set('t-dup', sessionId);
+  viewers.set('t-foreign', otherSession);
+  await controller.receive(payload());
+  assert.equal(launches().length, 1);
+  assert.deepEqual([...viewers], [['t-foreign', otherSession], ['t1', sessionId]]);
+  viewers.set('t-dup2', sessionId);
+  await controller.open();
+  assert.equal(launches().length, 1);
+  assert.deepEqual([...viewers], [['t-foreign', otherSession], ['t1', sessionId]]);
+});
+
+test('herdr-core: manual close holds for the same run, a new run reopens and is listed first', async t => {
+  const { controller, viewers, launches } = await coreSetup(t);
+  await controller.receive(payload());
+  viewers.clear();
+  await controller.receive(payload());
+  assert.equal(launches().length, 1);
+  await controller.receive(withNewerRun());
+  assert.equal(launches().length, 2);
+  assert.deepEqual((await readJson(controller.stateFile)).runs.map(run => run.id), ['dag_newer', 'dag_demo']);
+  assert.equal((await readJson(controller.recordFile)).runId, 'dag_newer');
+  viewers.clear();
+  await controller.receive(withNewerRun());
+  assert.equal(launches().length, 2);
+  await controller.open();
+  assert.equal(launches().length, 3);
+});
+
+test('herdr-core: stop closes this session viewer and its record, not other sessions', async t => {
+  const { controller, viewers } = await coreSetup(t);
+  viewers.set('t-foreign', otherSession);
+  await controller.receive(payload());
+  await controller.stop();
+  assert.deepEqual([...viewers], [['t-foreign', otherSession]]);
+  assert.equal(await readJson(controller.recordFile), null);
+  assert.equal((await readJson(controller.stateFile)).connected, false);
+});
+
+test('start reconciles stale snapshots of dead sessions before restoring', async t => {
+  const { controller, options } = await coreSetup(t);
+  const dead = spawnSync(process.execPath, ['-e', '']).pid;
+  const stale = join(options.stateDir, 'stale.json');
+  await writeJson(stale, { sessionId: otherSession, connected: true, owner: { pid: dead }, updatedAt: new Date().toISOString(),
+    runs: [{ id: 'r', status: 'running', nodes: [{ id: 'n', state: 'running' }] }], tasks: [] });
+  await controller.start();
+  const state = await readJson(stale);
+  assert.equal(state.connected, false);
+  assert.equal(state.runs[0].status, 'cancelled');
+});
+
+test('herdr-core: a session the window does not show yet is retried with back-off, never in a guessed tab', async t => {
+  const { options, herdr, controllers, launches } = await coreSetup(t);
+  let clock = 1_000_000, shown = false, attempts = 0;
+  const launch = herdr.launch;
+  herdr.launch = async launchOptions => {
+    attempts++;
+    if (!shown) throw new Error('parent_not_shown: the window does not show t0 yet');
+    return launch(launchOptions);
+  };
+  const controller = new DagPane({ ...options, herdr, now: () => clock });
+  controllers.add(controller);
+  await controller.receive(payload());
+  await controller.receive(payload());
+  assert.equal(attempts, 1, 'saves inside the back-off window do not retry');
+  assert.equal(await readJson(controller.recordFile), null);
+  clock += 2001;
+  await controller.receive(payload());
+  assert.equal(attempts, 2);
+  await controller.receive(payload());
+  assert.equal(attempts, 2, 'the back-off doubles');
+  shown = true;
+  await controller.open();
+  assert.equal(attempts, 3, '/dag-pane bypasses the back-off');
+  assert.equal(launches().length, 1);
+  assert.equal((await readJson(controller.recordFile)).paneId, 't1');
+});
+
+test('herdr-core: start closes legacy unlabelled viewers of this state file', async t => {
+  const { controller, herdr, viewers } = await coreSetup(t);
+  viewers.set('t-legacy', 'unlabelled');
+  const asked = [];
+  herdr.legacy = async stateFile => { asked.push(stateFile); return ['t-legacy']; };
+  await controller.start();
+  assert.deepEqual(asked, [controller.stateFile]);
+  assert.equal(viewers.has('t-legacy'), false);
+});
+
+test('herdr-core: saves on a settled run make no herdr-core calls; a new run checks again', async t => {
+  const { controller, calls, launches } = await coreSetup(t);
+  await controller.receive(payload());
+  await controller.receive(payload());
+  const settled = calls.length;
+  for (let i = 0; i < 5; i++) await controller.receive(payload());
+  assert.equal(calls.length, settled);
+  await controller.receive(withNewerRun());
+  assert.ok(calls.slice(settled).some(call => call[0] === 'get'));
+  assert.equal(launches().length, 1);
+});
+
+test('herdr-core: a forced open says why while the window does not show the session', async t => {
+  const { options, herdr, controllers } = await coreSetup(t);
+  const notes = [];
+  herdr.launch = async () => { throw new Error('parent_not_shown: the window does not show t0 yet'); };
+  const controller = new DagPane({ ...options, herdr, notify: message => notes.push(message) });
+  controllers.add(controller);
+  await controller.receive(payload());
+  assert.deepEqual(notes, []);
+  await controller.open();
+  assert.deepEqual(notes, [messages.en.notShown]);
 });
