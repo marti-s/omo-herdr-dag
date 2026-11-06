@@ -69,19 +69,19 @@ else if (args[0] === 'do' && args[1] === 'pane.split') {
   if (!tab) { out({ error: { message: 'no pane' } }); process.exit(1); }
   const entry = tab.terminals.find(entry => entry.pane === pane);
   tab.terminals = tab.terminals.filter(other => other !== entry);
-  db.terminals[entry.terminal].state = 'finished';
+  if (!db.closeLeavesLive) db.terminals[entry.terminal].state = 'finished';
   save(); out({ ok: true });
 } else { out({ error: { message: 'unknown' } }); process.exit(1); }
 `;
 
-async function fakes(t, { window = true, app = true, parentLabels = { 'herdr.space': 'sp1', 'herdr.tab': 'tb1' }, terminals = {}, tabName = 'm3', env: extra = {} } = {}) {
+async function fakes(t, { window = true, app = true, parentLabels = { 'herdr.space': 'sp1', 'herdr.tab': 'tb1' }, terminals = {}, tabName = 'm3', env: extra = {}, closeLeavesLive = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'hc-fake-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const bin = join(directory, 'bin');
   await mkdir(bin);
   const state = join(directory, 'state.json');
   const log = join(directory, 'calls.jsonl');
-  await writeFile(state, JSON.stringify({ next: 1,
+  await writeFile(state, JSON.stringify({ next: 1, closeLeavesLive,
     terminals: { t0: { address: 't0', name: 'session', state: 'live', where: 'w', labels: parentLabels }, ...terminals },
     window: window ? { spaces: [{ id: 'sp1', name: 'S', tabs: [{ id: 'tb1', name: tabName,
       terminals: window === 'no-parent' ? [] : [{ terminal: 't0', pane: 'p0' }] }] }] } : null }));
@@ -250,6 +250,16 @@ test('close uses pane.close for a viewer with a pane and hc kill otherwise, then
   const { terminals } = await world();
   assert.equal(terminals.t1, undefined);
   assert.equal(terminals.t9, undefined);
+});
+
+test('close kills and removes a viewer still ending after its pane closed', async t => {
+  const { env, calls, world } = await fakes(t, { closeLeavesLive: true });
+  const hc = createHc(env);
+  const address = await hc.launch({ parent: 't0', sessionId: session, cwd: '/tmp', argv });
+  await hc('close', address);
+  const log = (await calls()).filter(call => call[0] === 'hc' && ['kill', 'rm'].includes(call[1])).map(call => call[1]);
+  assert.deepEqual(log, ['rm', 'kill', 'rm']);
+  assert.equal((await world()).terminals[address], undefined);
 });
 
 test('unknown or finished terminals report pane_not_found', async t => {

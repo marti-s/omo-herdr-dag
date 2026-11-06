@@ -169,9 +169,14 @@ export function createHc(env = process.env) {
       const pane = await paneOf(address);
       if (pane) await app('do', 'pane.close', JSON.stringify({ pane }));
       else await hc('kill', address);
-      // A --rm fallback viewer is already gone once killed.
+      // A --rm viewer is already gone once killed; one the window just closed may still be ending.
       try { await hc('rm', address); }
-      catch (error) { if (!/pane_not_found/.test(error.message)) throw error; }
+      catch (error) {
+        if (/pane_not_found/.test(error.message)) return {};
+        await hc('kill', address).catch(() => {});
+        try { await hc('rm', address); }
+        catch (again) { if (!/pane_not_found/.test(again.message)) throw again; }
+      }
       return {};
     }
     throw new Error(`herdr-core: unsupported pane command ${command}`);
