@@ -9,6 +9,7 @@ import { DagPane, dagTitle, isDagViewerPane } from '../src/controller.mjs';
 import { readJson, writeJson } from '../src/storage.mjs';
 import { payload, sessionId } from './fixtures.mjs';
 import { normalizeRun } from '../src/model.mjs';
+import { messages } from '../src/i18n.mjs';
 
 async function setup(t) {
   const stateDir = await mkdtemp(join(tmpdir(), 'omo-dag-test-'));
@@ -463,4 +464,28 @@ test('herdr-core: start closes legacy unlabelled viewers of this state file', as
   await controller.start();
   assert.deepEqual(asked, [controller.stateFile]);
   assert.equal(viewers.has('t-legacy'), false);
+});
+
+test('herdr-core: saves on a settled run make no herdr-core calls; a new run checks again', async t => {
+  const { controller, calls, launches } = await coreSetup(t);
+  await controller.receive(payload());
+  await controller.receive(payload());
+  const settled = calls.length;
+  for (let i = 0; i < 5; i++) await controller.receive(payload());
+  assert.equal(calls.length, settled);
+  await controller.receive(withNewerRun());
+  assert.ok(calls.slice(settled).some(call => call[0] === 'get'));
+  assert.equal(launches().length, 1);
+});
+
+test('herdr-core: a forced open says why while the window does not show the session', async t => {
+  const { options, herdr, controllers } = await coreSetup(t);
+  const notes = [];
+  herdr.launch = async () => { throw new Error('parent_not_shown: the window does not show t0 yet'); };
+  const controller = new DagPane({ ...options, herdr, notify: message => notes.push(message) });
+  controllers.add(controller);
+  await controller.receive(payload());
+  assert.deepEqual(notes, []);
+  await controller.open();
+  assert.deepEqual(notes, [messages.en.notShown]);
 });

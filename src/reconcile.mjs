@@ -8,7 +8,8 @@ const INTERRUPTED = 'cancelled';
 
 function processAlive(pid) {
   try { process.kill(pid, 0); return true; }
-  catch { return false; }
+  // EPERM: alive, but owned by another user.
+  catch (error) { return error.code !== 'ESRCH'; }
 }
 
 // A state file whose owning session died still says connected/running; mark it

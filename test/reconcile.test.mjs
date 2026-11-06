@@ -41,3 +41,13 @@ test('reconcile interrupts dead-owner and old ownerless snapshots and leaves liv
 test('reconcile tolerates a missing state directory', async () => {
   assert.deepEqual(await reconcileStaleState(join(tmpdir(), 'omo-dag-missing-dir-xyz')), { reconciled: [], errors: [] });
 });
+
+test('reconcile keeps a snapshot whose owner is alive but not ours to signal (EPERM)', { skip: process.getuid?.() === 0 && 'root may signal pid 1' }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'omo-dag-reconcile-eperm-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  // pid 1 always exists and belongs to root, so signalling it from a normal user fails with EPERM.
+  const state = { connected: true, owner: { pid: 1 }, updatedAt: hoursAgo(48), runs: runs() };
+  await writeJson(join(dir, 'root-owned.json'), state);
+  assert.deepEqual((await reconcileStaleState(dir)).reconciled, []);
+  assert.deepEqual(await readJson(join(dir, 'root-owned.json')), state);
+});

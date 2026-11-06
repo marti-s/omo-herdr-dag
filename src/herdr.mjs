@@ -110,7 +110,10 @@ export function createHc(env = process.env) {
     try { ({ stdout } = await execute(bin, [command, '--json', ...args], options)); }
     catch (error) { stdout = error.stdout?.trim() ? error.stdout : error.stderr; if (!stdout?.trim().startsWith('{')) throw error; }
     const reply = stdout.trim() ? JSON.parse(stdout) : {};
-    if (reply.error) throw new Error(reply.error.kind === 'not_found' ? `pane_not_found: ${reply.error.message}` : reply.error.message);
+    if (reply.error) {
+      throw Object.assign(new Error(reply.error.kind === 'not_found' ? `pane_not_found: ${reply.error.message}` : reply.error.message),
+        { kind: reply.error.kind });
+    }
     return reply;
   };
   const app = async (...args) => {
@@ -133,12 +136,14 @@ export function createHc(env = process.env) {
   const runViewer = async (name, placement, { cwd, sessionId, argv }) => hc('run', '--bg', '--no-parent', '--outlive-parent', '--rm',
     '--cwd', cwd, '--name', name, ...placement, '--label', `${VIEWER}=viewer`, '--label', `${SESSION}=${sessionId}`, '--', ...argv);
   const runNamed = async (lane, placement, options) => {
+    const name = viewerName(lane, options.sessionId), unique = viewerName(lane, options.sessionId, true);
     let reply;
-    try { reply = await runViewer(viewerName(lane, options.sessionId), placement, options); }
-    // Another live terminal (another session of the same lane) holds the plain name.
+    try { reply = await runViewer(name, placement, options); }
+    // Another live terminal (another session of the same lane) holds the plain name. Any other
+    // failure, a timeout included, may have started a viewer already and must not start a second.
     catch (error) {
-      if (/pane_not_found/.test(error.message)) throw error;
-      reply = await runViewer(viewerName(lane, options.sessionId, true), placement, options);
+      if (error.kind !== 'name_taken' || unique === name) throw error;
+      reply = await runViewer(unique, placement, options);
     }
     return reply.address ?? reply.terminal?.address;
   };
@@ -190,7 +195,8 @@ export function createHc(env = process.env) {
       if (window && !where) throw new Error(`parent_not_shown: the window does not show ${parent} yet`);
       if (where) {
         const lane = laneName(where.tabName, { env, cwd });
-        if (lane && lane !== where.tabName) await app('do', 'tab.rename', JSON.stringify({ id: where.tab, name: lane }));
+        // Cosmetic: a failed rename must not keep the viewer from starting.
+        if (lane && lane !== where.tabName) await app('do', 'tab.rename', JSON.stringify({ id: where.tab, name: lane })).catch(() => {});
         return runNamed(lane, ['--label', `herdr.space=${where.space}`, '--label', `herdr.tab=${where.tab}`], { sessionId, cwd, argv });
       }
       const { labels = {} } = await hc('get', parent);

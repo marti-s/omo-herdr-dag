@@ -221,13 +221,16 @@ export class DagPane {
   async ensureViewer(force) {
     const record = await readJson(this.recordFile);
     const runId = this.runs[0]?.id ?? null;
+    // Saves run on every stream flush: once this run's viewer is settled, they need no hc calls.
+    if (!force && record && record.runId === runId && this.settledRun === runId) return record.paneId;
     if (record?.paneId && await this.isLive(record.paneId)) {
       for (const id of await this.sessionViewers()) if (id !== record.paneId) await this.closePane(id);
       if (record.runId !== runId) await writeJson(this.recordFile, { ...record, runId });
+      this.settledRun = runId;
       return record.paneId;
     }
     // A viewer closed (or a launch failed) during this run stays closed until a new run or /dag-pane.
-    if (record && !force && record.runId === runId) return record.paneId;
+    if (record && !force && record.runId === runId) { this.settledRun = runId; return record.paneId; }
     if (typeof this.node === 'function') this.node = await this.node();
     // Record an attempt before mutation: a timeout must not create repeated orphan viewers.
     await writeJson(this.recordFile, { attempted: true, runId });
@@ -238,9 +241,14 @@ export class DagPane {
         argv: [this.node, this.viewer, '--state', this.stateFile, '--owner-pid', String(process.pid)] });
     } catch (error) {
       // The window does not show this session yet: retry on the next save instead of guessing a tab.
-      if (/parent_not_shown/.test(error.message)) { await rm(this.recordFile, { force: true }); return null; }
+      if (/parent_not_shown/.test(error.message)) {
+        await rm(this.recordFile, { force: true });
+        if (force) this.notify(t(this.language, 'notShown'));
+        return null;
+      }
       throw error;
     }
+    this.settledRun = runId;
     if (!paneId) throw new Error(t(this.language, 'missingPaneId'));
     await writeJson(this.recordFile, { paneId, ready: true, runId });
     return paneId;

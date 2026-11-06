@@ -32,8 +32,9 @@ else if (command === 'rm') { const x = terminal(rest[0]); if (x.state === 'live'
 else if (command === 'run') {
   const name = flags('--name')[0];
   if (name && Object.values(db.terminals).some(x => x.state === 'live' && x.name === name)) {
-    process.stderr.write(JSON.stringify({ error: { kind: 'conflict', message: 'name taken: ' + name } }) + '\\n'); process.exit(3);
+    process.stderr.write(JSON.stringify({ error: { kind: 'name_taken', message: 'name taken: ' + name } }) + '\\n'); process.exit(3);
   }
+  if (db.failRun) { process.stderr.write(JSON.stringify({ error: { kind: db.failRun, message: 'run failed' } }) + '\\n'); process.exit(3); }
   const address = 't' + (db.next++);
   const labels = pairs(flags('--label'));
   db.terminals[address] = { address, name: name ?? address, state: 'live', where: 'w', labels, rm: rest.includes('--rm'), argv: rest.slice(rest.indexOf('--') + 1) };
@@ -59,6 +60,7 @@ else if (args[0] === 'do' && args[1] === 'pane.split') {
   tab.terminals.push({ terminal: address, pane: 'p' + address });
   save(); out({ pane: 'p' + address, terminal: address });
 } else if (args[0] === 'do' && args[1] === 'tab.rename') {
+  if (db.renameFails) { out({ error: { message: 'unknown command tab.rename' } }); process.exit(1); }
   const { id, name } = JSON.parse(args[2]);
   const tab = tabs.find(tab => tab.id === id);
   if (!tab) { out({ error: { message: 'no tab' } }); process.exit(1); }
@@ -74,14 +76,14 @@ else if (args[0] === 'do' && args[1] === 'pane.split') {
 } else { out({ error: { message: 'unknown' } }); process.exit(1); }
 `;
 
-async function fakes(t, { window = true, app = true, parentLabels = { 'herdr.space': 'sp1', 'herdr.tab': 'tb1' }, terminals = {}, tabName = 'm3', env: extra = {}, closeLeavesLive = false } = {}) {
+async function fakes(t, { window = true, app = true, parentLabels = { 'herdr.space': 'sp1', 'herdr.tab': 'tb1' }, terminals = {}, tabName = 'm3', env: extra = {}, closeLeavesLive = false, renameFails = false, failRun = null } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'hc-fake-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const bin = join(directory, 'bin');
   await mkdir(bin);
   const state = join(directory, 'state.json');
   const log = join(directory, 'calls.jsonl');
-  await writeFile(state, JSON.stringify({ next: 1, closeLeavesLive,
+  await writeFile(state, JSON.stringify({ next: 1, closeLeavesLive, renameFails, failRun,
     terminals: { t0: { address: 't0', name: 'session', state: 'live', where: 'w', labels: parentLabels }, ...terminals },
     window: window ? { spaces: [{ id: 'sp1', name: 'S', tabs: [{ id: 'tb1', name: tabName,
       terminals: window === 'no-parent' ? [] : [{ terminal: 't0', pane: 'p0' }] }] }] } : null }));
@@ -182,6 +184,18 @@ test('a second session of the same lane gets a session-unique viewer name', asyn
     t7: { address: 't7', name: 'omo-dag-m3', state: 'live', labels: { 'omo.dag': 'viewer', 'omo.dag.session': 'other' } } } });
   const address = await createHc(env).launch({ parent: 't0', sessionId: session, cwd: '/tmp/project', argv });
   assert.equal((await world()).terminals[address].name, viewerName('m3', session, true));
+});
+
+test('a failed tab rename still starts the viewer under the lane name', async t => {
+  const { env, world } = await fakes(t, { tabName: '2', env: { DORI_LANE: 'hostf' }, renameFails: true });
+  const address = await createHc(env).launch({ parent: 't0', sessionId: session, cwd: '/tmp/project', argv });
+  assert.equal((await world()).terminals[address].name, 'omo-dag-hostf');
+});
+
+test('a run failure other than a taken name is not retried with a second viewer', async t => {
+  const { env, calls } = await fakes(t, { failRun: 'timeout' });
+  await assert.rejects(createHc(env).launch({ parent: 't0', sessionId: session, cwd: '/tmp/project', argv }), /run failed/);
+  assert.equal((await calls()).filter(call => call[1] === 'run').length, 1);
 });
 
 test('launch refuses to guess a tab while the window does not show the session yet', async t => {
