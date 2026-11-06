@@ -40,7 +40,7 @@ else if (command === 'run') {
   db.terminals[address] = { address, name: name ?? address, state: 'live', where: 'w', labels, rm: rest.includes('--rm'), argv: rest.slice(rest.indexOf('--') + 1) };
   // Like Herdr: a herdr.tab label shows the terminal in that tab, beside the ones already there.
   const tab = db.window?.spaces.flatMap(space => space.tabs).find(tab => tab.id === labels['herdr.tab']);
-  if (tab) tab.terminals.push({ terminal: address, pane: 'p' + address, name: name ?? address });
+  if (tab && !db.hideRun) tab.terminals.push({ terminal: address, pane: 'p' + address, name: name ?? address });
   save(); out({ address, state: 'live' });
 } else fail('unknown command ' + command);
 `;
@@ -50,7 +50,9 @@ const args = process.argv.slice(2);
 log(['app', ...args]);
 if (!db.window) { out({ error: { message: 'no window' } }); process.exit(1); }
 const tabs = db.window.spaces.flatMap(space => space.tabs);
-if (args[0] === 'ls') out(db.window);
+if (args[0] === 'ls') { const { status, ...window } = db.window; out(window); }
+else if (args[0] === 'status') out(db.window.status ?? {});
+else if (args[0] === 'do' && args[1] === 'pane.focus') out({ ok: true });
 else if (args[0] === 'do' && args[1] === 'pane.split') {
   const { direction, pane, argv } = JSON.parse(args[2]);
   const tab = tabs.find(tab => tab.terminals.some(entry => entry.pane === pane));
@@ -76,16 +78,16 @@ else if (args[0] === 'do' && args[1] === 'pane.split') {
 } else { out({ error: { message: 'unknown' } }); process.exit(1); }
 `;
 
-async function fakes(t, { window = true, app = true, parentLabels = { 'herdr.space': 'sp1', 'herdr.tab': 'tb1' }, terminals = {}, tabName = 'm3', env: extra = {}, closeLeavesLive = false, renameFails = false, failRun = null } = {}) {
+async function fakes(t, { window = true, app = true, parentLabels = { 'herdr.space': 'sp1', 'herdr.tab': 'tb1' }, terminals = {}, tabName = 'm3', env: extra = {}, closeLeavesLive = false, renameFails = false, failRun = null, status = null, hideRun = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'hc-fake-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const bin = join(directory, 'bin');
   await mkdir(bin);
   const state = join(directory, 'state.json');
   const log = join(directory, 'calls.jsonl');
-  await writeFile(state, JSON.stringify({ next: 1, closeLeavesLive, renameFails, failRun,
+  await writeFile(state, JSON.stringify({ next: 1, closeLeavesLive, renameFails, failRun, hideRun,
     terminals: { t0: { address: 't0', name: 'session', state: 'live', where: 'w', labels: parentLabels }, ...terminals },
-    window: window ? { spaces: [{ id: 'sp1', name: 'S', tabs: [{ id: 'tb1', name: tabName,
+    window: window ? { status, spaces: [{ id: 'sp1', name: 'S', tabs: [{ id: 'tb1', name: tabName,
       terminals: window === 'no-parent' ? [] : [{ terminal: 't0', pane: 'p0' }] }] }] } : null }));
   const prelude = `#!${process.execPath}
 const fs = require('node:fs');
@@ -184,6 +186,31 @@ test('a second session of the same lane gets a session-unique viewer name', asyn
     t7: { address: 't7', name: 'omo-dag-m3', state: 'live', labels: { 'omo.dag': 'viewer', 'omo.dag.session': 'other' } } } });
   const address = await createHc(env).launch({ parent: 't0', sessionId: session, cwd: '/tmp/project', argv });
   assert.equal((await world()).terminals[address].name, viewerName('m3', session, true));
+});
+
+test('a viewer joining the tab the person is typing in hands focus back to the agent', async t => {
+  const { env, calls } = await fakes(t, { status: { tab: 'tb1', focused_pane: 'p0' } });
+  await createHc(env).launch({ parent: 't0', sessionId: session, cwd: '/tmp/project', argv });
+  const log = await calls();
+  const run = log.findIndex(call => call[1] === 'run'), focus = log.findIndex(call => call[2] === 'pane.focus');
+  assert.ok(focus > run);
+  assert.deepEqual(JSON.parse(log[focus][3]), { pane: 'p0' });
+});
+
+test('focus is left alone when the person looks at another tab or another pane', async t => {
+  for (const status of [{ tab: 'tb9', focused_pane: 'p9' }, { tab: 'tb1', focused_pane: 'p-other' }]) {
+    const { env, calls } = await fakes(t, { status });
+    await createHc(env).launch({ parent: 't0', sessionId: session, cwd: '/tmp/project', argv });
+    assert.ok(!(await calls()).some(call => call[2] === 'pane.focus'), JSON.stringify(status));
+  }
+});
+
+test('handing focus back gives up after a bounded wait when the window never shows the viewer', async t => {
+  const { env, calls } = await fakes(t, { status: { tab: 'tb1', focused_pane: 'p0' }, hideRun: true });
+  let pauses = 0;
+  await createHc(env, { pause: async () => { pauses++; } }).launch({ parent: 't0', sessionId: session, cwd: '/tmp/project', argv });
+  assert.equal(pauses, 20);
+  assert.ok(!(await calls()).some(call => call[2] === 'pane.focus'));
 });
 
 test('a failed tab rename still starts the viewer under the lane name', async t => {

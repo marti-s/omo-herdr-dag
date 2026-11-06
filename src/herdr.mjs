@@ -101,7 +101,7 @@ export function locateTerminal(window, terminal) {
 
 // Answers the pane commands DagPane uses (list, get, close) and adds launch.
 // A viewer is identified only by its hc labels, never by its name.
-export function createHc(env = process.env) {
+export function createHc(env = process.env, { pause = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
   const options = { env, timeout: 10000, maxBuffer: 2 * 1024 * 1024 };
   const hc = async (command, ...args) => {
     const bin = resolveHcBin(env);
@@ -197,7 +197,21 @@ export function createHc(env = process.env) {
         const lane = laneName(where.tabName, { env, cwd });
         // Cosmetic: a failed rename must not keep the viewer from starting.
         if (lane && lane !== where.tabName) await app('do', 'tab.rename', JSON.stringify({ id: where.tab, name: lane })).catch(() => {});
-        return runNamed(lane, ['--label', `herdr.space=${where.space}`, '--label', `herdr.tab=${where.tab}`], { sessionId, cwd, argv });
+        // A viewer joining the tab the person is looking at takes its focus; keystrokes meant for
+        // the agent would then land in the viewer. Hand focus back once the window shows the viewer.
+        const status = await app('status').catch(() => null);
+        const typing = status?.tab === where.tab && status?.focused_pane === where.pane;
+        const address = await runNamed(lane, ['--label', `herdr.space=${where.space}`, '--label', `herdr.tab=${where.tab}`], { sessionId, cwd, argv });
+        if (typing && address) {
+          for (let tries = 0; tries < 20; tries++) {
+            if (locateTerminal(await windowLs(), address)) {
+              await app('do', 'pane.focus', JSON.stringify({ pane: where.pane })).catch(() => {});
+              break;
+            }
+            await pause(100);
+          }
+        }
+        return address;
       }
       const { labels = {} } = await hc('get', parent);
       const placement = ['herdr.space', 'herdr.tab'].filter(key => labels[key] !== undefined)
