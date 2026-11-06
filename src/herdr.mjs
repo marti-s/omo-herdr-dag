@@ -71,6 +71,34 @@ export function resolveHerdrAppBin(env = process.env) {
 const VIEWER = 'omo.dag';
 const SESSION = 'omo.dag.session';
 
+// The lane a viewer serves: its tab's name, unless that is only a number.
+export function laneName(tabName, { env = process.env, cwd } = {}) {
+  const name = String(tabName ?? '').trim();
+  if (name && !/^\d+$/.test(name)) return name;
+  return env.DORI_LANE?.trim() || (cwd ? cwd.split(/[/\\]/).filter(Boolean).pop() : '') || '';
+}
+
+// hc names are 1-32 of a-z 0-9 - _ and unique among live terminals.
+export function viewerName(lane, sessionId, unique = false) {
+  const slug = text => String(text).toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  const tail = slug(sessionId).replaceAll('-', '').slice(-6);
+  const base = slug(lane) || tail;
+  const name = unique && base !== tail ? `${base.slice(0, 32 - 8 - 7)}-${tail}` : base;
+  return `omo-dag-${name}`.slice(0, 32).replace(/[-_]+$/, '');
+}
+
+// Where the window shows a terminal: { space, tab, tabName, pane }; null when the window
+// does not show it (yet), undefined when there is no herdr-app or no window at all.
+export function locateTerminal(window, terminal) {
+  for (const space of window?.spaces ?? []) {
+    for (const tab of space.tabs ?? []) {
+      const found = (tab.terminals ?? []).find(entry => entry.terminal === terminal);
+      if (found) return { space: space.id, tab: tab.id, tabName: tab.name, pane: found.pane ?? null };
+    }
+  }
+  return null;
+}
+
 // Answers the pane commands DagPane uses (list, get, close) and adds launch.
 // A viewer is identified only by its hc labels, never by its name.
 export function createHc(env = process.env) {
@@ -95,19 +123,24 @@ export function createHc(env = process.env) {
     if (reply.error) throw new Error(`herdr-app: ${reply.error.message ?? JSON.stringify(reply.error)}`);
     return reply;
   };
+  const windowLs = async () => {
+    if (!resolveHerdrAppBin(env)) return undefined;
+    try { return await app('ls'); }
+    catch { return undefined; }
+  };
   // The window pane showing a terminal, or null without herdr-app, a window, or a pane.
-  const paneOf = async terminal => {
-    if (!resolveHerdrAppBin(env)) return null;
-    let window;
-    try { window = await app('ls'); }
-    catch { return null; }
-    for (const space of window.spaces ?? []) {
-      for (const tab of space.tabs ?? []) {
-        const found = (tab.terminals ?? []).find(entry => entry.terminal === terminal);
-        if (found?.pane) return found.pane;
-      }
+  const paneOf = async terminal => locateTerminal(await windowLs(), terminal)?.pane ?? null;
+  const runViewer = async (name, placement, { cwd, sessionId, argv }) => hc('run', '--bg', '--no-parent', '--outlive-parent', '--rm',
+    '--cwd', cwd, '--name', name, ...placement, '--label', `${VIEWER}=viewer`, '--label', `${SESSION}=${sessionId}`, '--', ...argv);
+  const runNamed = async (lane, placement, options) => {
+    let reply;
+    try { reply = await runViewer(viewerName(lane, options.sessionId), placement, options); }
+    // Another live terminal (another session of the same lane) holds the plain name.
+    catch (error) {
+      if (/pane_not_found/.test(error.message)) throw error;
+      reply = await runViewer(viewerName(lane, options.sessionId, true), placement, options);
     }
-    return null;
+    return reply.address ?? reply.terminal?.address;
   };
   const live = async address => {
     const terminal = await hc('get', address);
@@ -143,20 +176,35 @@ export function createHc(env = process.env) {
     }
     throw new Error(`herdr-core: unsupported pane command ${command}`);
   }, {
+    // The viewer joins its session's own tab, right of the session's pane in the window layout,
+    // named after the lane. A tab named only by a number is renamed to the lane first.
     async launch({ parent, sessionId, cwd, argv }) {
-      const pane = await paneOf(parent);
-      if (pane) {
-        const { terminal } = await app('do', 'pane.split', JSON.stringify({ direction: 'right', pane, argv }));
-        if (!terminal) throw new Error('herdr-app: pane.split returned no terminal');
-        await hc('label', terminal, `${VIEWER}=viewer`, `${SESSION}=${sessionId}`);
-        return terminal;
+      const window = await windowLs();
+      const where = locateTerminal(window, parent);
+      // A window that does not show the session yet must not get a viewer in some other tab.
+      if (window && !where) throw new Error(`parent_not_shown: the window does not show ${parent} yet`);
+      if (where) {
+        const lane = laneName(where.tabName, { env, cwd });
+        if (lane && lane !== where.tabName) await app('do', 'tab.rename', JSON.stringify({ id: where.tab, name: lane }));
+        return runNamed(lane, ['--label', `herdr.space=${where.space}`, '--label', `herdr.tab=${where.tab}`], { sessionId, cwd, argv });
       }
       const { labels = {} } = await hc('get', parent);
       const placement = ['herdr.space', 'herdr.tab'].filter(key => labels[key] !== undefined)
         .flatMap(key => ['--label', `${key}=${labels[key]}`]);
-      const reply = await hc('run', '--bg', '--no-parent', '--outlive-parent', '--rm', '--cwd', cwd, ...placement,
-        '--label', `${VIEWER}=viewer`, '--label', `${SESSION}=${sessionId}`, '--', ...argv);
-      return reply.address ?? reply.terminal?.address;
+      return runNamed(laneName(labels.where?.split(' / ').pop(), { env, cwd }), placement, { sessionId, cwd, argv });
+    },
+    // Viewers from before the omo.dag labels: unlabelled omo-dag-* terminals showing this state file.
+    async legacy(stateFile) {
+      const { terminals = [] } = await hc('ls');
+      const found = [];
+      for (const { address } of terminals) {
+        let terminal;
+        try { terminal = await hc('get', address); }
+        catch (error) { if (/pane_not_found/.test(error.message)) continue; throw error; }
+        if (terminal.state !== 'live' || !terminal.name?.startsWith('omo-dag-') || terminal.labels?.[VIEWER]) continue;
+        if ((terminal.argv ?? []).includes(stateFile)) found.push(address);
+      }
+      return found;
     },
   });
 }

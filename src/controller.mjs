@@ -73,6 +73,11 @@ export class DagPane {
         const { errors } = await reconcileStaleState(this.stateDir);
         for (const { file, error } of errors) this.notify(`DAG pane: Cannot reconcile ${file}: ${error.message}`);
       } catch (error) { this.notify(`DAG pane: Cannot reconcile stale state: ${error.message}`); }
+      // Viewers of an older install carry no omo.dag labels; replace the ones showing this session.
+      if (this.herdr.legacy) {
+        try { for (const id of await this.herdr.legacy(this.stateFile)) await this.closePane(id); }
+        catch (error) { this.notify(`DAG pane: ${error.message}`); }
+      }
       const state = await readJson(this.stateFile);
       if (state?.sessionId === this.sessionId) {
         this.runs = state.runs ?? [];
@@ -227,8 +232,15 @@ export class DagPane {
     // Record an attempt before mutation: a timeout must not create repeated orphan viewers.
     await writeJson(this.recordFile, { attempted: true, runId });
     for (const id of await this.sessionViewers()) await this.closePane(id);
-    const paneId = await this.herdr.launch({ parent: this.parentPane, sessionId: this.sessionId, cwd: this.cwd,
-      argv: [this.node, this.viewer, '--state', this.stateFile, '--owner-pid', String(process.pid)] });
+    let paneId;
+    try {
+      paneId = await this.herdr.launch({ parent: this.parentPane, sessionId: this.sessionId, cwd: this.cwd,
+        argv: [this.node, this.viewer, '--state', this.stateFile, '--owner-pid', String(process.pid)] });
+    } catch (error) {
+      // The window does not show this session yet: retry on the next save instead of guessing a tab.
+      if (/parent_not_shown/.test(error.message)) { await rm(this.recordFile, { force: true }); return null; }
+      throw error;
+    }
     if (!paneId) throw new Error(t(this.language, 'missingPaneId'));
     await writeJson(this.recordFile, { paneId, ready: true, runId });
     return paneId;

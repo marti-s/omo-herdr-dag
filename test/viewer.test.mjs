@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -278,12 +278,19 @@ finally:
   os.close(master)
 `;
 
-function openViewer(file, t, extraArgs = []) {
+// A viewer under test must never reach the real herdr-core or window: the test runner's own
+// HC_TERMINAL_ID is the agent running the tests, and closing it would kill that agent.
+function isolatedEnv(overrides = {}) {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(HC_|HERDR_)/.test(key)));
+  return { ...env, HC_BIN_PATH: '/nonexistent/herdr-core', HC_APP_BIN_PATH: '/nonexistent/herdr-app', HERDR_BIN_PATH: '/nonexistent/herdr', ...overrides };
+}
+
+function openViewer(file, t, extraArgs = [], env = isolatedEnv()) {
   const events = new EventEmitter();
   const viewerArgs = [fileURLToPath(new URL('../src/viewer.mjs', import.meta.url)), '--state', file, ...extraArgs];
   const child = process.platform === 'win32'
-    ? spawn(process.execPath, [fileURLToPath(new URL('./windows-pty.mjs', import.meta.url)), ...viewerArgs], { stdio: ['pipe', 'pipe', 'pipe'] })
-    : spawn('python3', ['-u', '-c', bridge, process.execPath, ...viewerArgs], { stdio: ['pipe', 'pipe', 'pipe'] });
+    ? spawn(process.execPath, [fileURLToPath(new URL('./windows-pty.mjs', import.meta.url)), ...viewerArgs], { stdio: ['pipe', 'pipe', 'pipe'], env })
+    : spawn('python3', ['-u', '-c', bridge, process.execPath, ...viewerArgs], { stdio: ['pipe', 'pipe', 'pipe'], env });
   let buffer = '', stderr = '', lastFrame = '';
   child.stderr.on('data', data => { stderr += data; });
   child.stdout.setEncoding('utf8');
@@ -531,6 +538,41 @@ test('real viewer exits when the --owner-pid process is gone', { timeout: 15000 
   owner.stdin.end();
   await ownerExited;
   assert.equal((await viewerExited)[0], 0);
+});
+
+test('a quitting viewer closes its hc terminal only when that terminal is its own labelled viewer', { timeout: 20000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dag-self-close-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'session.json'), log = join(dir, 'calls.jsonl'), hc = join(dir, 'herdr-core');
+  await writeJson(file, { sessionId: 'self-session', connected: true, runs: [], tasks: [{ id: 'x', status: 'completed', description: 'SELF_TASK' }] });
+  // Fake hc: logs each call; `get` answers with the labels from FAKE_LABELS.
+  await writeFile(hc, `#!${process.execPath}\nconst fs = require('node:fs');\nconst [command, , address] = process.argv.slice(2);\n` +
+    `fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify([command, address]) + '\\n');\n` +
+    `console.log(JSON.stringify(command === 'get' ? { address, state: 'live', labels: JSON.parse(process.env.FAKE_LABELS) } : {}));\n`);
+  await chmod(hc, 0o755);
+  const calls = async () => (await readFile(log, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line)[0]);
+  for (const [labels, closes] of [[{}, false], [{ 'omo.dag': 'viewer', 'omo.dag.session': 'other' }, false],
+    [{ 'omo.dag': 'viewer', 'omo.dag.session': 'self-session' }, true]]) {
+    await rm(log, { force: true });
+    const viewer = openViewer(file, t, [], isolatedEnv({ HC_TERMINAL_ID: 't0', HC_BIN_PATH: hc, FAKE_LABELS: JSON.stringify(labels) }));
+    await viewer.frame(text => text.includes('SELF_TASK'));
+    await viewer.close();
+    assert.equal((await calls()).includes('kill'), closes, JSON.stringify(labels));
+  }
+});
+
+test('a following viewer switches to a newly started run before any of its nodes runs', { timeout: 15000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dag-newest-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'session.json');
+  const run = (id, name, status) => ({ id, name, status, nodes: [{ id: 'a', label: `${name}_NODE`, state: status === 'running' ? 'pending' : status }], edges: [] });
+  const state = { sessionId: 'newest-session', connected: true, runs: [run('r1', 'OLD_RUN', 'completed')], tasks: [] };
+  await writeJson(file, state);
+  const viewer = openViewer(file, t);
+  await viewer.frame(text => text.includes('OLD_RUN'));
+  state.runs = [run('r2', 'NEW_RUN', 'running'), ...state.runs];
+  await viewer.frame(text => text.includes('NEW_RUN_NODE'), () => writeJson(file, state));
+  await viewer.close();
 });
 
 test('real viewer clock advances elapsed without new snapshots or input', { timeout: 15000 }, async t => {

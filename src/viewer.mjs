@@ -65,7 +65,10 @@ async function refresh() {
     const next = await readJson(file);
     if (next) {
       const sessionChanged = next.sessionId !== state?.sessionId;
+      // A newly started run takes over the view while following, even before its first node runs.
+      const newRun = follow && next.runs?.[0]?.id && next.runs[0].id !== state?.runs?.[0]?.id;
       state = next; error = '';
+      if (newRun && !sessionChanged) { selectedId = state.runs[0].id; view = 'dag'; scroll = 0; target = undefined; }
       if (sessionChanged) {
         await saving; selectedNodes.clear(); selectedTaskId = undefined; scroll = 0;
         selectedId = state?.runs?.[0]?.id; completedExpanded = false;
@@ -111,7 +114,13 @@ async function close(closePane = false) {
     try { await createHerdr()('close', pane); }
     catch (error) { process.stderr.write(`${t(state?.language, 'closeFailed', { error: error.message })}\n`); }
   } else if (closePane && process.env.HC_TERMINAL_ID) {
-    try { await createHc()('close', process.env.HC_TERMINAL_ID); }
+    // Close only this session's own viewer terminal: a viewer started from an agent's shell
+    // (or a test) inherits that agent's HC_TERMINAL_ID and must never close the agent.
+    try {
+      const hc = createHc();
+      const own = await hc('get', process.env.HC_TERMINAL_ID);
+      if (own.labels?.['omo.dag'] === 'viewer' && own.labels?.['omo.dag.session'] === state?.sessionId) await hc('close', process.env.HC_TERMINAL_ID);
+    }
     catch (error) {
       if (!String(error.message).includes('pane_not_found')) process.stderr.write(`${t(state?.language, 'closeFailed', { error: error.message })}\n`);
     }

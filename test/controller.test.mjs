@@ -437,3 +437,30 @@ test('start reconciles stale snapshots of dead sessions before restoring', async
   assert.equal(state.connected, false);
   assert.equal(state.runs[0].status, 'cancelled');
 });
+
+test('herdr-core: a session the window does not show yet gets its viewer on a later update, not a guessed tab', async t => {
+  const { controller, herdr, launches } = await coreSetup(t);
+  const launch = herdr.launch;
+  let shown = false;
+  herdr.launch = async options => {
+    if (!shown) { launch.calls = (launch.calls ?? 0) + 1; throw new Error('parent_not_shown: the window does not show t0 yet'); }
+    return launch(options);
+  };
+  await controller.receive(payload());
+  assert.equal(launches().length, 0);
+  assert.equal(await readJson(controller.recordFile), null);
+  shown = true;
+  await controller.receive(payload());
+  assert.equal(launches().length, 1);
+  assert.equal((await readJson(controller.recordFile)).paneId, 't1');
+});
+
+test('herdr-core: start closes legacy unlabelled viewers of this state file', async t => {
+  const { controller, herdr, viewers } = await coreSetup(t);
+  viewers.set('t-legacy', 'unlabelled');
+  const asked = [];
+  herdr.legacy = async stateFile => { asked.push(stateFile); return ['t-legacy']; };
+  await controller.start();
+  assert.deepEqual(asked, [controller.stateFile]);
+  assert.equal(viewers.has('t-legacy'), false);
+});

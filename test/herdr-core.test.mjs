@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { isDagViewerPane } from '../src/controller.mjs';
-import { createHc, createHerdr, hcSession, resolveHcBin, resolveHerdrAppBin } from '../src/herdr.mjs';
+import { createHc, createHerdr, hcSession, laneName, locateTerminal, resolveHcBin, resolveHerdrAppBin, viewerName } from '../src/herdr.mjs';
 
 const session = '019a0000-aaaa-7000-8000-000000000001';
 const argv = ['/usr/bin/node', '/tmp/viewer.mjs', '--state', '/tmp/s.json', '--owner-pid', '42'];
@@ -30,8 +30,16 @@ else if (command === 'label') { const x = terminal(rest[0]); x.labels = { ...x.l
 else if (command === 'kill') { const x = terminal(rest[0]); if (x.rm) delete db.terminals[rest[0]]; else x.state = 'finished'; save(); out({}); }
 else if (command === 'rm') { const x = terminal(rest[0]); if (x.state === 'live') { process.stderr.write('{"error":{"kind":"live","message":"live"}}\\n'); process.exit(3); } delete db.terminals[rest[0]]; save(); out({}); }
 else if (command === 'run') {
+  const name = flags('--name')[0];
+  if (name && Object.values(db.terminals).some(x => x.state === 'live' && x.name === name)) {
+    process.stderr.write(JSON.stringify({ error: { kind: 'conflict', message: 'name taken: ' + name } }) + '\\n'); process.exit(3);
+  }
   const address = 't' + (db.next++);
-  db.terminals[address] = { address, name: address, state: 'live', where: 'w', labels: pairs(flags('--label')), rm: rest.includes('--rm') };
+  const labels = pairs(flags('--label'));
+  db.terminals[address] = { address, name: name ?? address, state: 'live', where: 'w', labels, rm: rest.includes('--rm'), argv: rest.slice(rest.indexOf('--') + 1) };
+  // Like Herdr: a herdr.tab label shows the terminal in that tab, beside the ones already there.
+  const tab = db.window?.spaces.flatMap(space => space.tabs).find(tab => tab.id === labels['herdr.tab']);
+  if (tab) tab.terminals.push({ terminal: address, pane: 'p' + address, name: name ?? address });
   save(); out({ address, state: 'live' });
 } else fail('unknown command ' + command);
 `;
@@ -50,6 +58,11 @@ else if (args[0] === 'do' && args[1] === 'pane.split') {
   db.terminals[address] = { address, name: address, state: 'live', where: 'w', labels: {}, argv };
   tab.terminals.push({ terminal: address, pane: 'p' + address });
   save(); out({ pane: 'p' + address, terminal: address });
+} else if (args[0] === 'do' && args[1] === 'tab.rename') {
+  const { id, name } = JSON.parse(args[2]);
+  const tab = tabs.find(tab => tab.id === id);
+  if (!tab) { out({ error: { message: 'no tab' } }); process.exit(1); }
+  tab.name = name; save(); out({ ok: true });
 } else if (args[0] === 'do' && args[1] === 'pane.close') {
   const { pane } = JSON.parse(args[2]);
   const tab = tabs.find(tab => tab.terminals.some(entry => entry.pane === pane));
@@ -61,7 +74,7 @@ else if (args[0] === 'do' && args[1] === 'pane.split') {
 } else { out({ error: { message: 'unknown' } }); process.exit(1); }
 `;
 
-async function fakes(t, { window = true, app = true, parentLabels = { 'herdr.space': 'sp1', 'herdr.tab': 'tb1' }, terminals = {} } = {}) {
+async function fakes(t, { window = true, app = true, parentLabels = { 'herdr.space': 'sp1', 'herdr.tab': 'tb1' }, terminals = {}, tabName = 'm3', env: extra = {} } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'hc-fake-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const bin = join(directory, 'bin');
@@ -70,7 +83,7 @@ async function fakes(t, { window = true, app = true, parentLabels = { 'herdr.spa
   const log = join(directory, 'calls.jsonl');
   await writeFile(state, JSON.stringify({ next: 1,
     terminals: { t0: { address: 't0', name: 'session', state: 'live', where: 'w', labels: parentLabels }, ...terminals },
-    window: window ? { spaces: [{ id: 'sp1', name: 'S', tabs: [{ id: 'tb1', name: 'T',
+    window: window ? { spaces: [{ id: 'sp1', name: 'S', tabs: [{ id: 'tb1', name: tabName,
       terminals: window === 'no-parent' ? [] : [{ terminal: 't0', pane: 'p0' }] }] }] } : null }));
   const prelude = `#!${process.execPath}
 const fs = require('node:fs');
@@ -84,7 +97,7 @@ const log = call => fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(cal
   if (app) await write('herdr-app', APP);
   const socket = join(directory, 'hc.sock');
   await writeFile(socket, '');
-  const env = { PATH: bin, HC_TERMINAL_ID: 't0', HC_TERMINAL_SOCKET: socket, HOME: directory };
+  const env = { PATH: bin, HC_TERMINAL_ID: 't0', HC_TERMINAL_SOCKET: socket, HOME: directory, ...extra };
   const calls = async () => (await readFile(log, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
   const world = async () => JSON.parse(await readFile(state, 'utf8'));
   return { bin, env, calls, world, directory };
@@ -117,41 +130,84 @@ test('createHerdr stays the Herdr pane adapter even inside a herdr-core terminal
   assert.equal(typeof createHc(env).launch, 'function');
 });
 
-test('launch splits right of the parent pane with the viewer argv, then labels the new terminal', async t => {
+test('the lane is the tab name unless it is only a number, then DORI_LANE, then the folder', () => {
+  assert.equal(laneName('M3', { env: {} }), 'M3');
+  assert.equal(laneName('2', { env: { DORI_LANE: 'policy' } }), 'policy');
+  assert.equal(laneName('17', { env: {}, cwd: '/Users/me/dev/forma-rs-omo/m2a' }), 'm2a');
+  assert.equal(laneName(undefined, { env: {} }), '');
+});
+
+test('viewer names follow the lane, fit hc names and differ by session only when made unique', () => {
+  const a = '01a1aded-1111-7000-8000-00000000aaaa', b = '01a1aded-2222-7000-8000-00000000bbbb';
+  assert.equal(viewerName('M3', a), 'omo-dag-m3');
+  assert.equal(viewerName('goa config / x', a), 'omo-dag-goa-config-x');
+  // Sessions sharing the first 8 id characters still get distinct unique names.
+  assert.notEqual(viewerName('m3', a, true), viewerName('m3', b, true));
+  assert.equal(viewerName('m3', a, true), 'omo-dag-m3-00aaaa');
+  assert.equal(viewerName('', a), 'omo-dag-00aaaa');
+  for (const name of [viewerName('a'.repeat(60), a), viewerName('a'.repeat(60), a, true)]) assert.match(name, /^[a-z0-9_-]{1,32}$/);
+});
+
+test('locateTerminal finds the space, tab and pane that show a terminal', () => {
+  const window = { spaces: [{ id: 'sp1', tabs: [{ id: 'tb1', name: 'lead', terminals: [{ terminal: 't2g', pane: 'pa' }] },
+    { id: 'tb2', name: 'm3', terminals: [{ terminal: 't3h', pane: 'pb' }, { terminal: 't3j', pane: 'pc' }] }] }] };
+  assert.deepEqual(locateTerminal(window, 't3h'), { space: 'sp1', tab: 'tb2', tabName: 'm3', pane: 'pb' });
+  assert.equal(locateTerminal(window, 't99'), null);
+  assert.equal(locateTerminal(undefined, 't3h'), null);
+});
+
+test('launch runs a lane-named viewer in the session\'s own tab, after the session\'s pane', async t => {
   const { env, calls, world } = await fakes(t);
-  const address = await createHc(env).launch({ parent: 't0', sessionId: session, cwd: '/tmp/project', argv });
-  assert.equal(address, 't1');
-  const log = await calls();
-  const split = log.findIndex(call => call[0] === 'app' && call[2] === 'pane.split');
-  const label = log.findIndex(call => call[0] === 'hc' && call[1] === 'label');
-  assert.ok(split >= 0 && label > split);
-  assert.deepEqual(JSON.parse(log[split][3]), { direction: 'right', pane: 'p0', argv });
-  assert.deepEqual(log[label], ['hc', 'label', '--json', 't1', 'omo.dag=viewer', `omo.dag.session=${session}`]);
-  assert.ok(!log.some(call => call[1] === 'run'));
-  const { terminals } = await world();
-  assert.deepEqual(terminals.t1.argv, argv);
-  assert.deepEqual(terminals.t1.labels, { 'omo.dag': 'viewer', 'omo.dag.session': session });
-});
-
-test('launch falls back to hc run in the parent space and tab when the parent has no pane', async t => {
-  const { env, calls } = await fakes(t, { window: 'no-parent' });
   assert.equal(await createHc(env).launch({ parent: 't0', sessionId: session, cwd: '/tmp/project', argv }), 't1');
-  const log = await calls();
-  assert.ok(!log.some(call => call[0] === 'app' && call[1] === 'do'));
   // --json goes before the program; everything after -- is the viewer's own argv.
-  assert.deepEqual(log.find(call => call[1] === 'run'), ['hc', 'run', '--json', '--bg', '--no-parent', '--outlive-parent', '--rm',
-    '--cwd', '/tmp/project', '--label', 'herdr.space=sp1', '--label', 'herdr.tab=tb1',
+  assert.deepEqual((await calls()).find(call => call[1] === 'run'), ['hc', 'run', '--json', '--bg', '--no-parent', '--outlive-parent', '--rm',
+    '--cwd', '/tmp/project', '--name', 'omo-dag-m3', '--label', 'herdr.space=sp1', '--label', 'herdr.tab=tb1',
     '--label', 'omo.dag=viewer', '--label', `omo.dag.session=${session}`, '--', ...argv]);
+  const { window, terminals } = await world();
+  assert.deepEqual(window.spaces[0].tabs[0].terminals.map(entry => entry.terminal), ['t0', 't1']);
+  assert.deepEqual(terminals.t1.labels, { 'herdr.space': 'sp1', 'herdr.tab': 'tb1', 'omo.dag': 'viewer', 'omo.dag.session': session });
 });
 
-test('launch falls back to hc run when herdr-app is absent or has no window', async t => {
+test('launch renames a tab named only by a number to the lane', async t => {
+  const { env, calls, world } = await fakes(t, { tabName: '2', env: { DORI_LANE: 'hostf' } });
+  await createHc(env).launch({ parent: 't0', sessionId: session, cwd: '/tmp/project', argv });
+  const log = await calls();
+  assert.deepEqual(JSON.parse(log.find(call => call[2] === 'tab.rename')[3]), { id: 'tb1', name: 'hostf' });
+  assert.ok(log.find(call => call[1] === 'run').includes('omo-dag-hostf'));
+  assert.equal((await world()).window.spaces[0].tabs[0].name, 'hostf');
+});
+
+test('a second session of the same lane gets a session-unique viewer name', async t => {
+  const { env, world } = await fakes(t, { terminals: {
+    t7: { address: 't7', name: 'omo-dag-m3', state: 'live', labels: { 'omo.dag': 'viewer', 'omo.dag.session': 'other' } } } });
+  const address = await createHc(env).launch({ parent: 't0', sessionId: session, cwd: '/tmp/project', argv });
+  assert.equal((await world()).terminals[address].name, viewerName('m3', session, true));
+});
+
+test('launch refuses to guess a tab while the window does not show the session yet', async t => {
+  const { env, calls } = await fakes(t, { window: 'no-parent' });
+  await assert.rejects(createHc(env).launch({ parent: 't0', sessionId: session, cwd: '/tmp/project', argv }), /parent_not_shown/);
+  assert.ok(!(await calls()).some(call => call[1] === 'run'));
+});
+
+test('launch falls back to hc run with the parent labels when herdr-app is absent or has no window', async t => {
   for (const options of [{ app: false, parentLabels: { 'herdr.space': 'sp1' } }, { window: false, parentLabels: { 'herdr.space': 'sp1' } }]) {
     const { env, calls } = await fakes(t, options);
     assert.equal(await createHc(env).launch({ parent: 't0', sessionId: session, cwd: '/tmp/project', argv }), 't1');
     assert.deepEqual((await calls()).find(call => call[1] === 'run'), ['hc', 'run', '--json', '--bg', '--no-parent', '--outlive-parent', '--rm',
-      '--cwd', '/tmp/project', '--label', 'herdr.space=sp1',
+      '--cwd', '/tmp/project', '--name', 'omo-dag-project', '--label', 'herdr.space=sp1',
       '--label', 'omo.dag=viewer', '--label', `omo.dag.session=${session}`, '--', ...argv]);
   }
+});
+
+test('legacy finds only unlabelled live omo-dag-* viewers of the given state file', async t => {
+  const { env } = await fakes(t, { terminals: {
+    t1: { address: 't1', name: 'omo-dag-01a1aded', state: 'live', labels: {}, argv: ['node', 'viewer.mjs', '--state', '/s/a.json'] },
+    t2: { address: 't2', name: 'omo-dag-01a1aded', state: 'live', labels: {}, argv: ['node', 'viewer.mjs', '--state', '/s/b.json'] },
+    t3: { address: 't3', name: 'omo-dag-m3', state: 'live', labels: { 'omo.dag': 'viewer' }, argv: ['--state', '/s/a.json'] },
+    t4: { address: 't4', name: 'zsh', state: 'live', labels: {}, argv: ['--state', '/s/a.json'] },
+  } });
+  assert.deepEqual(await createHc(env).legacy('/s/a.json'), ['t1']);
 });
 
 test('list returns only live omo.dag=viewer terminals with their full session ids', async t => {
