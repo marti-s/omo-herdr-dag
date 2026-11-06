@@ -278,9 +278,9 @@ finally:
   os.close(master)
 `;
 
-function openViewer(file, t) {
+function openViewer(file, t, extraArgs = []) {
   const events = new EventEmitter();
-  const viewerArgs = [fileURLToPath(new URL('../src/viewer.mjs', import.meta.url)), '--state', file];
+  const viewerArgs = [fileURLToPath(new URL('../src/viewer.mjs', import.meta.url)), '--state', file, ...extraArgs];
   const child = process.platform === 'win32'
     ? spawn(process.execPath, [fileURLToPath(new URL('./windows-pty.mjs', import.meta.url)), ...viewerArgs], { stdio: ['pipe', 'pipe', 'pipe'] })
     : spawn('python3', ['-u', '-c', bridge, process.execPath, ...viewerArgs], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -312,7 +312,7 @@ function openViewer(file, t) {
       Promise.resolve().then(action).catch(finish);
     });
   }
-  return { frame, send, async close() {
+  return { frame, send, child, async close() {
     const exited = once(child, 'exit', { signal: AbortSignal.timeout(5000) });
     send({ keys: 'q' });
     assert.equal((await exited)[0], 0, stderr);
@@ -515,6 +515,22 @@ test('real PTY follows empty/task/DAG transitions, keeps a running task on paral
   state.connected = true;
   await viewer.frame(text => text.includes('RETURNED_TASK') && text.includes(messages['zh-cn'].followOn), () => writeJson(file, state));
   await viewer.close();
+});
+
+test('real viewer exits when the --owner-pid process is gone', { timeout: 15000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dag-owner-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'session.json');
+  await writeJson(file, { sessionId: 'owner-session', connected: true, runs: [], tasks: [{ id: 'x', status: 'completed', description: 'OWNER_TASK' }] });
+  const owner = spawn(process.execPath, ['-e', 'process.stdin.resume()'], { stdio: ['pipe', 'ignore', 'ignore'] });
+  await once(owner, 'spawn');
+  const viewer = openViewer(file, t, ['--owner-pid', String(owner.pid)]);
+  await viewer.frame(text => text.includes('OWNER_TASK'));
+  const ownerExited = once(owner, 'exit');
+  const viewerExited = once(viewer.child, 'exit', { signal: AbortSignal.timeout(8000) });
+  owner.stdin.end();
+  await ownerExited;
+  assert.equal((await viewerExited)[0], 0);
 });
 
 test('real viewer clock advances elapsed without new snapshots or input', { timeout: 15000 }, async t => {

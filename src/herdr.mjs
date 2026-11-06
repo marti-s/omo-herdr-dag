@@ -57,44 +57,105 @@ export function hcSession(env = process.env) {
   return Boolean(resolveHcBin(env));
 }
 
-const hcName = title => `omo-dag-${title.replace(/^DAG · /, '').toLowerCase().replace(/[^a-z0-9_-]/g, '')}`.slice(0, 32);
+// herdr-app drives the visible window; it places the viewer beside its session's pane.
+export function resolveHerdrAppBin(env = process.env) {
+  const explicit = env.HC_APP_BIN_PATH?.trim();
+  if (explicit) return executableFile(explicit) ? explicit : null;
+  for (const dir of (env.PATH ?? '').split(delimiter)) {
+    if (dir && executableFile(join(dir, 'herdr-app'))) return join(dir, 'herdr-app');
+  }
+  const fallback = join(env.HOME ?? homedir(), '.local', 'bin', 'herdr-app');
+  return executableFile(fallback) ? fallback : null;
+}
 
-// Answers the pane commands DagPane uses (list, get, close) and adds launch,
-// which starts the viewer as its own terminal in the session's space and tab.
+const VIEWER = 'omo.dag';
+const SESSION = 'omo.dag.session';
+
+// Answers the pane commands DagPane uses (list, get, close) and adds launch.
+// A viewer is identified only by its hc labels, never by its name.
 export function createHc(env = process.env) {
+  const options = { env, timeout: 10000, maxBuffer: 2 * 1024 * 1024 };
   const hc = async (command, ...args) => {
     const bin = resolveHcBin(env);
     if (!bin) throw new Error('herdr-core is not available in this session');
     let stdout;
-    try { ({ stdout } = await execute(bin, [command, '--json', ...args], { env, timeout: 10000, maxBuffer: 2 * 1024 * 1024 })); }
+    try { ({ stdout } = await execute(bin, [command, '--json', ...args], options)); }
     catch (error) { stdout = error.stdout?.trim() ? error.stdout : error.stderr; if (!stdout?.trim().startsWith('{')) throw error; }
     const reply = stdout.trim() ? JSON.parse(stdout) : {};
     if (reply.error) throw new Error(reply.error.kind === 'not_found' ? `pane_not_found: ${reply.error.message}` : reply.error.message);
     return reply;
   };
+  const app = async (...args) => {
+    const bin = resolveHerdrAppBin(env);
+    if (!bin) throw new Error('herdr-app is not available');
+    let stdout;
+    try { ({ stdout } = await execute(bin, args, options)); }
+    catch (error) { stdout = error.stdout; if (!stdout?.trim().startsWith('{')) throw error; }
+    const reply = stdout.trim() ? JSON.parse(stdout) : {};
+    if (reply.error) throw new Error(`herdr-app: ${reply.error.message ?? JSON.stringify(reply.error)}`);
+    return reply;
+  };
+  // The window pane showing a terminal, or null without herdr-app, a window, or a pane.
+  const paneOf = async terminal => {
+    if (!resolveHerdrAppBin(env)) return null;
+    let window;
+    try { window = await app('ls'); }
+    catch { return null; }
+    for (const space of window.spaces ?? []) {
+      for (const tab of space.tabs ?? []) {
+        const found = (tab.terminals ?? []).find(entry => entry.terminal === terminal);
+        if (found?.pane) return found.pane;
+      }
+    }
+    return null;
+  };
+  const live = async address => {
+    const terminal = await hc('get', address);
+    if (terminal.state !== 'live') throw new Error(`pane_not_found: ${address} is ${terminal.state}`);
+    return terminal;
+  };
   return Object.assign(async (command, ...args) => {
     if (command === 'list') {
-      const { terminals = [] } = await hc('ls');
-      return { panes: terminals.map(terminal => ({ pane_id: terminal.address, tab_id: terminal.where,
-        label: terminal.name?.startsWith('omo-dag-') ? `DAG · ${terminal.name.slice(8)}` : terminal.name })) };
+      const { terminals = [] } = await hc('ls', '--label', `${VIEWER}=viewer`);
+      const panes = [];
+      for (const { address } of terminals) {
+        // ls carries no labels; get supplies the session and skips ones that just ended.
+        let terminal;
+        try { terminal = await live(address); }
+        catch (error) { if (/pane_not_found/.test(error.message)) continue; throw error; }
+        if (terminal.labels?.[VIEWER] !== 'viewer') continue;
+        const session = terminal.labels[SESSION] ?? '';
+        panes.push({ pane_id: address, session, label: `DAG · ${session.slice(0, 8)}` });
+      }
+      return { panes };
     }
-    if (command === 'get') {
-      const terminal = await hc('get', args[0]);
-      if (terminal.state !== 'live') throw new Error(`pane_not_found: ${args[0]} is ${terminal.state}`);
-      return terminal;
-    }
+    if (command === 'get') return live(args[0]);
     if (command === 'close') {
-      await hc('kill', args[0]);
+      const [address] = args;
+      await live(address);
+      const pane = await paneOf(address);
+      if (pane) await app('do', 'pane.close', JSON.stringify({ pane }));
+      else await hc('kill', address);
+      // A --rm fallback viewer is already gone once killed.
+      try { await hc('rm', address); }
+      catch (error) { if (!/pane_not_found/.test(error.message)) throw error; }
       return {};
     }
     throw new Error(`herdr-core: unsupported pane command ${command}`);
   }, {
-    async launch({ parent, title, cwd, argv }) {
+    async launch({ parent, sessionId, cwd, argv }) {
+      const pane = await paneOf(parent);
+      if (pane) {
+        const { terminal } = await app('do', 'pane.split', JSON.stringify({ direction: 'right', pane, argv }));
+        if (!terminal) throw new Error('herdr-app: pane.split returned no terminal');
+        await hc('label', terminal, `${VIEWER}=viewer`, `${SESSION}=${sessionId}`);
+        return terminal;
+      }
       const { labels = {} } = await hc('get', parent);
-      const placement = Object.entries(labels).filter(([key]) => key === 'where' || key === 'herdr.space')
-        .flatMap(([key, value]) => ['--label', `${key}=${value}`]);
-      const reply = await hc('run', '--bg', '--name', hcName(title), '--no-parent', '--outlive-parent', '--rm',
-        '--cwd', cwd, ...placement, '--', ...argv);
+      const placement = ['herdr.space', 'herdr.tab'].filter(key => labels[key] !== undefined)
+        .flatMap(key => ['--label', `${key}=${labels[key]}`]);
+      const reply = await hc('run', '--bg', '--no-parent', '--outlive-parent', '--rm', '--cwd', cwd, ...placement,
+        '--label', `${VIEWER}=viewer`, '--label', `${SESSION}=${sessionId}`, '--', ...argv);
       return reply.address ?? reply.terminal?.address;
     },
   });

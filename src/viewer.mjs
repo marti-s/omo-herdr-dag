@@ -1,7 +1,7 @@
 import { watch } from 'node:fs';
 import { basename, dirname } from 'node:path';
 import { emitKeypressEvents } from 'node:readline';
-import { createHerdr } from './herdr.mjs';
+import { createHc, createHerdr } from './herdr.mjs';
 import { t } from './i18n.mjs';
 import { renderFrame, runningTarget, standaloneTasks } from './render.mjs';
 import { readJson } from './storage.mjs';
@@ -24,6 +24,12 @@ async function restorePreferences() {
   catch (cause) { viewState = emptyViewState(state?.sessionId); viewError = cause.message; }
 }
 await restorePreferences();
+const ownerPid = process.argv.includes('--owner-pid') ? Number(process.argv[process.argv.indexOf('--owner-pid') + 1]) : undefined;
+function ownerGone() {
+  if (!Number.isInteger(ownerPid) || ownerPid <= 0) return false;
+  try { process.kill(ownerPid, 0); return false; }
+  catch (cause) { return cause.code === 'ESRCH'; }
+}
 const interactive = Boolean(process.stdout.isTTY && process.stdin.isTTY);
 function draw() {
   if (closing) return;
@@ -88,6 +94,7 @@ const resize = () => draw();
 process.stdout.on('resize', resize);
 // Advance only the display clock. Snapshot reads remain driven by fs.watch.
 const clock = setInterval(() => {
+  if (ownerGone()) return void close(true);
   if (state?.connected && (state.tasks?.some(task => task.status === 'running') ||
       state.runs?.some(run => run.nodes.some(node => node.state === 'running')))) draw();
 }, 1000);
@@ -103,6 +110,11 @@ async function close(closePane = false) {
     const pane = process.argv[process.argv.indexOf('--close-pane') + 1];
     try { await createHerdr()('close', pane); }
     catch (error) { process.stderr.write(`${t(state?.language, 'closeFailed', { error: error.message })}\n`); }
+  } else if (closePane && process.env.HC_TERMINAL_ID) {
+    try { await createHc()('close', process.env.HC_TERMINAL_ID); }
+    catch (error) {
+      if (!String(error.message).includes('pane_not_found')) process.stderr.write(`${t(state?.language, 'closeFailed', { error: error.message })}\n`);
+    }
   }
   process.exit(0);
 }
