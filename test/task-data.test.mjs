@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { link, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { link, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TaskData, normalizeTask } from '../src/task-data.mjs';
@@ -28,7 +28,8 @@ test('actual RPC fields normalize to a bounded whitelist with ISO timestamps and
       last_assistant_line: 'LATEST_PROGRESS_EXCERPT', current_tool: 'bash' },
     spawn_spec: { prompt: 'PRIVATE PROMPT' }, final_response: 'PRIVATE OUTPUT' })), {
     id: 'st_root', description: 'Investigate', agent: 'explore', model: 'provider/model', status: 'running',
-    startedAt: '2026-09-06T00:00:00.000Z', progress: '[bash] LATEST_PROGRESS_EXCERPT', turns: 0, toolCalls: 3,
+    updatedAt: '2026-09-06T00:00:01.000Z', startedAt: '2026-09-06T00:00:00.000Z',
+    progress: '[bash] LATEST_PROGRESS_EXCERPT', turns: 0, toolCalls: 3,
   });
   assert.deepEqual(normalizeTask({ task_id: 'st_missing' }), { id: 'st_missing' });
   assert.equal(normalizeTask({ task_id: '../escape' }), null);
@@ -190,6 +191,117 @@ test('late durable records cannot resurrect an earlier execution endpoint during
   assert.deepEqual(await data.refresh([]), completed);
 });
 
+test('snapshot reload preserves the freshness watermark instead of using the earlier completion time', async t => {
+  const { data, save, stateDir, cwd } = await setup(t);
+  await save(record('st_root', { status: 'completed', terminal_at: '2026-09-06T00:01:00Z',
+    updated_at: '2026-09-06T00:10:00Z', residency_state: 'evicted', run_stats: { turns: 7, tool_calls: 11 } }));
+  const completed = await data.refresh([]);
+  assert.equal(completed[0].updatedAt, '2026-09-06T00:10:00.000Z');
+  const restored = new TaskData({ cwd, sessionId, stateDir });
+  t.after(() => restored.stop());
+  restored.restore(completed);
+  // Replayed snapshots can arrive after an extension reload, including ones
+  // later than completion but older than its final residency update.
+  for (const updated_at of [undefined, 'invalid', '2026-09-06T00:05:00Z', '2026-09-06T00:10:00Z']) {
+    restored.receive({ parent_session_id: sessionId, tasks: [{ task_id: 'st_root', status: 'running', updated_at,
+      live_progress: { activity: 'stale running progress' } }] });
+    assert.deepEqual(restored.snapshot([]), completed);
+  }
+  restored.receive({ parent_session_id: sessionId, tasks: [{ task_id: 'st_root', status: 'running',
+    updated_at: '2026-09-06T00:12:00Z', live_progress: { activity: 'resumed work' } }] });
+  const resumed = restored.snapshot([])[0];
+  assert.equal(resumed.status, 'running');
+  assert.equal(resumed.progress, 'resumed work');
+  assert.equal(resumed.updatedAt, '2026-09-06T00:12:00.000Z');
+  assert.equal(Object.hasOwn(resumed, 'completedAt'), false);
+});
+
+test('a restored resumed task rejects an older terminal disk record', async t => {
+  const { data, save, stateDir, cwd } = await setup(t);
+  data.receive({ parent_session_id: sessionId, tasks: [record('st_root', {
+    updated_at: '2026-09-06T00:12:00Z', live_progress: { activity: 'resumed work' } })] });
+  const resumed = data.snapshot([]);
+  const restored = new TaskData({ cwd, sessionId, stateDir });
+  t.after(() => restored.stop());
+  restored.restore(resumed);
+  await save(record('st_root', { status: 'completed', terminal_at: '2026-09-06T00:01:00Z',
+    updated_at: '2026-09-06T00:10:00Z' }));
+  assert.deepEqual(await restored.refresh([]), resumed);
+});
+
+test('an older terminal endpoint cannot overwrite newer running evidence without a valid updated_at', async t => {
+  const { data, save } = await setup(t);
+  data.receive({ parent_session_id: sessionId, tasks: [record('st_root', {
+    updated_at: '2026-09-06T00:12:00Z', live_progress: { activity: 'resumed work' } })] });
+  const resumed = data.snapshot([]);
+  for (const updated_at of [undefined, 'invalid']) {
+    const stale = record('st_root', { status: 'completed', updated_at,
+      terminal_at: '2026-09-06T00:10:00Z', run_stats: { turns: 99 } });
+    data.receive({ parent_session_id: sessionId, tasks: [stale] });
+    assert.deepEqual(data.snapshot([]), resumed);
+    await save(stale);
+    assert.deepEqual(await data.refresh([]), resumed);
+  }
+  // The stale completion must not make an equal-time running replay look like
+  // an invalid resumption of a completed task.
+  data.receive({ parent_session_id: sessionId, tasks: [record('st_root', {
+    updated_at: '2026-09-06T00:12:00Z', live_progress: { activity: 'current progress' } })] });
+  assert.deepEqual(data.snapshot([]), [{ ...resumed[0], progress: 'current progress' }]);
+});
+
+test('a newer terminal endpoint supplies a durable watermark and permits a later resumption', async t => {
+  const { data, cwd, stateDir } = await setup(t);
+  data.receive({ parent_session_id: sessionId, tasks: [record('st_root', {
+    updated_at: '2026-09-06T00:12:00Z', live_progress: { activity: 'working' } })] });
+  data.receive({ parent_session_id: sessionId, tasks: [{ task_id: 'st_root', status: 'completed',
+    terminal_at: '2026-09-06T00:13:00Z' }] });
+  const completed = data.snapshot([]);
+  assert.equal(completed[0].status, 'completed');
+  assert.equal(completed[0].updatedAt, '2026-09-06T00:13:00.000Z');
+  assert.equal(completed[0].completedAt, '2026-09-06T00:13:00.000Z');
+  assert.equal(Object.hasOwn(completed[0], 'progress'), false);
+  const restored = new TaskData({ cwd, sessionId, stateDir });
+  t.after(() => restored.stop());
+  restored.restore(completed);
+  for (const updated_at of ['2026-09-06T00:12:30Z', '2026-09-06T00:13:00Z']) {
+    restored.receive({ parent_session_id: sessionId, tasks: [{ task_id: 'st_root', status: 'running', updated_at }] });
+    assert.deepEqual(restored.snapshot([]), completed);
+  }
+  restored.receive({ parent_session_id: sessionId, tasks: [{ task_id: 'st_root', status: 'running',
+    updated_at: '2026-09-06T00:14:00Z', live_progress: { activity: 'new attempt' } }] });
+  const resumed = restored.snapshot([])[0];
+  assert.equal(resumed.status, 'running');
+  assert.equal(resumed.updatedAt, '2026-09-06T00:14:00.000Z');
+  assert.equal(resumed.progress, 'new attempt');
+  assert.equal(Object.hasOwn(resumed, 'completedAt'), false);
+});
+
+test('undated conflicting statuses preserve dated evidence while compatible updates still merge', async t => {
+  const { data } = await setup(t);
+  data.receive({ parent_session_id: sessionId, tasks: [record('st_root', {
+    updated_at: '2026-09-06T00:12:00Z', live_progress: { activity: 'working' } })] });
+  const running = data.snapshot([]);
+  for (const updated_at of [undefined, 'invalid']) {
+    data.receive({ parent_session_id: sessionId, tasks: [{ task_id: 'st_root', status: 'completed',
+      updated_at, terminal_at: 'invalid' }] });
+    assert.deepEqual(data.snapshot([]), running);
+  }
+  data.receive({ parent_session_id: sessionId, tasks: [{ task_id: 'st_root', status: 'running',
+    live_progress: { activity: 'current progress' } }] });
+  assert.deepEqual(data.snapshot([]), [{ ...running[0], progress: 'current progress' }]);
+  data.receive({ parent_session_id: sessionId, tasks: [{ task_id: 'st_undated', status: 'running' }] });
+  data.receive({ parent_session_id: sessionId, tasks: [{ task_id: 'st_undated', status: 'completed' }] });
+  assert.deepEqual(data.snapshot([]).find(task => task.id === 'st_undated'), { id: 'st_undated', status: 'completed' });
+});
+
+test('an equal-timestamp running disk snapshot cannot undo terminal RPC evidence', async t => {
+  const { data, save } = await setup(t);
+  data.receive({ parent_session_id: sessionId, tasks: [record('st_root', { status: 'completed' })] });
+  const completed = data.snapshot([]);
+  await save(record('st_root', { live_progress: { activity: 'before completion' } }));
+  assert.deepEqual(await data.refresh([]), completed);
+});
+
 test('project store selects all own-session roots and verified session descendants, never DAG dependencies', async t => {
   const { data, save, stateDir } = await setup(t);
   await Promise.all([
@@ -261,6 +373,38 @@ test('a queued watcher callback cannot publish or rearm after stop', async t => 
   watcher.emit('change', 'rename', '.omo');
   assert.equal(calls, 0);
   assert.equal(data.watcher, undefined);
+});
+
+test('refresh recovers a failed task watcher and receives subsequent changes', { timeout: 3000 }, async t => {
+  let signal;
+  const { data, save, messages } = await setup(t, () => { void data.refresh([]).then(tasks => signal?.(tasks)); });
+  await save(record('st_root'));
+  data.start();
+  const failed = data.watcher;
+  failed.emit('error', new Error('watcher lost'));
+  await data.refresh([]);
+  assert.notEqual(data.watcher, failed);
+  assert.ok(data.watcher);
+  assert.ok(messages.some(message => message.includes('watcher lost')));
+  const changed = new Promise(resolve => { signal = tasks => { if (tasks[0]?.status === 'completed') resolve(); }; });
+  await save(record('st_root', { status: 'completed', updated_at: '2026-09-06T00:02:00Z' }));
+  await changed;
+});
+
+test('refresh rebinds the watcher when the task directory is replaced at the same path', { timeout: 3000 }, async t => {
+  let signal;
+  const { data, save, stateDir } = await setup(t, () => { void data.refresh([]).then(tasks => signal?.(tasks)); });
+  await save(record('st_root'));
+  data.start();
+  const previous = data.watcher;
+  await rename(join(stateDir, 'tasks'), join(stateDir, 'retired-tasks'));
+  await save(record('st_root', { updated_at: '2026-09-06T00:01:00Z' }));
+  await data.refresh([]);
+  assert.notEqual(data.watcher, previous);
+  assert.equal(data.watchedDirectory, join(stateDir, 'tasks'));
+  const changed = new Promise(resolve => { signal = tasks => { if (tasks[0]?.status === 'completed') resolve(); }; });
+  await save(record('st_root', { status: 'completed', updated_at: '2026-09-06T00:02:00Z' }));
+  await changed;
 });
 
 test('malformed records report diagnostics while valid records and explicit store paths still work', async t => {

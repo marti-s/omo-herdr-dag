@@ -6,6 +6,8 @@
 
 `omo-herdr-dag` 是一个 [OmO](https://github.com/code-yeongyu/oh-my-openagent) 扩展：当 workflow DAG 出现时，在 [Herdr](https://herdr.dev/) 中打开一个专用 TUI。你可以在对话旁边跟踪节点状态与依赖关系，而焦点仍保留在原 pane 中。
 
+此 fork 支持新的 `herdr-core`（`hc`）与 `herdr-app` 终端布局，也兼容旧版 `herdr pane` 接口。请从 [marti-s/omo-herdr-dag](https://github.com/marti-s/omo-herdr-dag) 安装；上游 npm 包不包含此 fork 的 `herdr-app` 挂接改动。
+
 [![OmO 在左侧运行 integration review，右侧 Herdr DAG pane 显示运行中的 navigation、gate-wiring、test-coverage 和等待中的 verify-evidence。](https://raw.githubusercontent.com/jc01rho/omo-herdr-dag/main/docs/screenshots/workflow-in-progress-en.png)](https://raw.githubusercontent.com/jc01rho/omo-herdr-dag/main/docs/screenshots/workflow-in-progress-en.png)
 
 *一个进行中的 integration review：`navigation`、`gate-wiring` 和 `test-coverage` 并行运行；`verify-evidence` 依赖这三个任务。右侧 pane 在对话旁边显示节点状态、依赖关系和任务详情。*
@@ -16,10 +18,10 @@ https://github.com/user-attachments/assets/cd918f5f-3b89-43c8-9d75-34fddadb2760
 
 ## 主要功能
 
-- 使用原 pane 约 35% 的宽度自动打开右侧 pane。
+- 在 `herdr-app` 中将 viewer 挂接到所属会话的标签页；旧版 Herdr 则打开占原 pane 约 35% 宽度的右侧 pane。
 - 从 OmO workflow snapshot 更新节点状态与依赖关系。
-- 状态更新或扩展重载时复用同一会话的 pane。
-- 会话结束后仍保留已完成和失败的运行结果。
+- 复用正常运行的 viewer；终端仍存在但 viewer 进程丢失时，核验状态并恢复，不仅依赖终端是否存在。
+- 在保存的会话 snapshot 中保留已完成和失败的运行结果。
 - 支持滚动以及多个运行之间的切换。
 - 自动展开运行中任务的详情，折叠其他状态；已保存的用户选择优先。
 - 即使没有 workflow DAG，也显示当前会话的普通子任务。
@@ -33,46 +35,40 @@ https://github.com/user-attachments/assets/cd918f5f-3b89-43c8-9d75-34fddadb2760
 | --- | --- |
 | Node.js | 24 或更高版本。已在 24.14.0 和 26.7.0 上测试。 |
 | OmO | 暴露 `omo.dag.updated` 事件的版本。已在 `5.0.0-0.beta.42` 和 Senpi `2026.9.4-3` 上验证。 |
-| Herdr | 已安装并在运行，且 `herdr` 可在 `PATH` 上找到；必须支持下文描述的 pane 命令。已针对 protocol 20 做集成测试。 |
-| 终端 | 在 Herdr pane 中运行 OmO，使用 UTF-8 终端和支持制表符（box-drawing）的字体。 |
+| Herdr | 新接口：`herdr-core`/`hc` 与 `herdr-app`，OmO 在其管理的终端中运行。旧接口：`PATH` 上可找到且支持下文 pane 命令的 `herdr`。 |
+| 终端 | 在 Herdr 管理的终端或旧版 pane 中运行 OmO，使用 UTF-8 终端和支持框线字符（box-drawing）的字体。 |
 
-**此扩展不要求在 Herdr 中注册自定义 OmO agent。** 打开一个普通的 Herdr 终端 pane 并自行运行 `omo` 即可。扩展使用 pane ID 和普通的 `herdr pane` 命令；不调用 `herdr agent start`，也不依赖侧边栏的 agent 识别。
+**此扩展不要求在 Herdr 中注册自定义 OmO agent。** 在 Herdr 管理的终端中运行 `omo` 即可。新接口使用 `hc` 终端标签与 `herdr-app` 窗口布局，将 viewer 挂接在所属会话旁，保留 lane 名称并将焦点交还给 agent。旧接口使用 `herdr pane` 命令。
 
-该架构支持上述方式，且已在原生 macOS 上、于全新且未修改的 Herdr 安装中完成端到端验证；更早之前在 Windows PowerShell 上验证过 viewer 启动与真实渲染。具体的验证覆盖范围和仍未覆盖的部分见[验证与兼容性](VERIFICATION.md)。Windows pane 应使用 PowerShell，而不是 cmd.exe 或 Git Bash。
+历史实机检查与具体版本组合见[验证与兼容性](VERIFICATION.md)。这些检查不代表此 fork 新增的 `herdr-app` 恢复改动已经通过实机兼容性验证；本次改动有本地自动化测试覆盖。旧版 Windows pane 应使用 PowerShell，而不是 cmd.exe 或 Git Bash。
 
 ## 安装
 
-先分别安装 OmO 和 Herdr。本包已在 [npm](https://www.npmjs.com/package/omo-herdr-dag) 上发布。
+先分别安装 OmO 和 Herdr。要使用 `herdr-app` 支持及下文的恢复修复，请使用此 fork 的源码安装程序。
 
-### 从 npm 安装
-
-```bash
-npx omo-herdr-dag@latest install --dry-run
-npx omo-herdr-dag@latest install
-```
-
-首次安装默认为英语。要选择简体中文：
+### 从此 fork 安装
 
 ```bash
-npx omo-herdr-dag@latest install --lang zh-cn
-```
-
-要显式选择韩语，请使用 `npx omo-herdr-dag@latest install --lang ko`；要显式选择英语（包括从其他语言切回），请使用 `npx omo-herdr-dag@latest install --lang en`。更新时除非另行指定，否则保留已保存的语言。
-
-你也可以全局安装 CLI：`npm install -g omo-herdr-dag`，然后运行 `omo-herdr-dag install`。仅获取 npm 包不会修改你的 OmO 配置；必须显式执行 `install` 命令才会把扩展复制到目标位置。Herdr 和 OmO 仍是独立的前置条件。
-
-### 从源码安装（现已可用）
-
-克隆本仓库并运行安装程序：
-
-```bash
-git clone https://github.com/jc01rho/omo-herdr-dag.git
+git clone https://github.com/marti-s/omo-herdr-dag.git
 cd omo-herdr-dag
 npm ci --ignore-scripts
 npm test
 node scripts/install.mjs --dry-run
 node scripts/install.mjs
 ```
+
+首次安装默认为英语。要选择简体中文或韩语：
+
+```bash
+node scripts/install.mjs --lang zh-cn
+node scripts/install.mjs --lang ko
+```
+
+使用 `node scripts/install.mjs --lang en` 可选择英语。更新时除非另行选择，否则保留已保存的语言。显式运行安装程序才会把扩展复制到 OmO 的 agent 目录；仅更新源码检出不会替换已安装副本。
+
+### 上游 npm 包
+
+[上游 npm 包](https://www.npmjs.com/package/omo-herdr-dag) 单独发行。运行 `npx omo-herdr-dag@latest install` 会安装上游版本，可能替换此 fork 已安装的集成。要保留此 fork 的行为，请使用上面的源码安装程序。
 
 运行时没有 npm 依赖。Windows 测试使用仅开发用的 `node-pty` ConPTY 桥；POSIX 测试使用 Python 3 和 Unix PTY。`--dry-run` 只打印目标位置，不修改文件。源码安装程序同样接受 `--lang en`、`--lang ko` 或 `--lang zh-cn`。
 
@@ -104,6 +100,8 @@ node scripts/install.mjs --agent-dir /path/to/your/agent-directory
 
 启动时，扩展还会从 `<task state directory>/dag/runs/` 恢复当前会话已保存的 DAG checkpoint，并合并其任务详情。如果 viewer 缓存为空，`/dag-pane` 会尝试同样的恢复，且不会重跑任何任务。其他会话的 checkpoint 不会显示。安装新文件不会替换正在运行的 OmO 会话已加载的代码：使用恢复功能前请先重载扩展。
 
+事件与文件监视提供即时更新。此外，每两秒会重新读取任务记录、DAG checkpoint 和 viewer snapshot，避免遗漏通知后画面一直停滞。已记录时间戳较新的状态优先于旧状态。恢复只重新读取已报告的状态，不重跑任务，也不根据 worker 完成推断 workflow 节点完成。
+
 [![OmO 命令补全列出 dag-pane 及其打开或重新打开当前会话 DAG pane 的英语描述。](https://raw.githubusercontent.com/jc01rho/omo-herdr-dag/main/docs/screenshots/dag-pane-command-en.png)](https://raw.githubusercontent.com/jc01rho/omo-herdr-dag/main/docs/screenshots/dag-pane-command-en.png)
 
 | 位置 | 命令或按键 | 作用 |
@@ -122,7 +120,7 @@ node scripts/install.mjs --agent-dir /path/to/your/agent-directory
 
 边框、标题和状态标记按照实际执行状态着色，而不是按照选择着色：运行中为青色，完成为绿色，失败/错误为红色，暂停/阻塞为黄色。`>` 表示选择。自动跟随默认 ON，保持当前运行中的目标直到它完成，再跟随下一个运行中的节点或普通任务。DAG 跟随显示图形中的节点框，而不是跳到详情卡片；必要时切换运行或视图。并行任务的到来和流式文字不会导致目标之间循环跳转。
 
-滚动、选择、切换运行/视图、折叠/展开和查看完整详情会暂停自动跟随，更新不会打断查看。底部显示本地化的跟随 ON/OFF 和 `f`。断开的快照显示 OFF，不显示实时模型活动。跟随状态仅保存在当前 viewer 中，不改变已保存的折叠偏好。
+只有 `f` 会切换自动跟随。滚动、选择、切换运行/视图、折叠/展开和查看完整详情只是临时查看；自动跟随为 ON 时，下一次重绘会再次跟随正在运行的工作。要持续查看较早的工作，请先按 `f`。底部显示本地化的跟随 ON/OFF；断开的快照显示 OFF，不显示实时模型活动。跟随状态仅保存在当前 viewer 中，不改变已保存的折叠偏好。
 
 `>` 标记选中的节点，`[-]` 表示展开，`[+]` 表示折叠。图形和依赖列表始终位于详情面板上方。偏好保存在 `<snapshot path>.view.json` 中；这个 viewer 专属文件不会被 workflow 更新覆盖。
 
@@ -132,7 +130,7 @@ DAG 详情卡片在顶部边框中显示图形的节点标签，即使折叠也�
 
 展开的任务卡片默认为四行紧凑显示：状态与任务描述、agent 和短模型名、一行进度、以及带轮次/工具计数的耗时。长进度文本在此视图中会被裁剪。按 `d` 查看任务 ID、精确时间戳、完整模型名和原始进度文本；再按一次返回紧凑卡片。完整详情查看是临时的，不会替换已保存的展开/折叠设置。
 
-OmO 会话结束时，最后的图形仍保持可见，并带有断开连接的指示和明确的关闭提示：
+所属 OmO 会话结束时，`herdr-core` viewer 会关闭。旧版 Herdr 会保留最后的图形，显示断开连接状态和明确的关闭提示：
 
 ```text
 ○ 已断开连接 · 快照已保存
@@ -140,6 +138,8 @@ OmO 会话结束时，最后的图形仍保持可见，并带有断开连接的�
 ```
 
 你可以保留 snapshot 以供参考，或按 `q` 关闭 viewer 及其生成的 pane。关闭 viewer 不会取消 workflow 任务，也不会删除已保存的 snapshot。过期 snapshot 会在扩展启动时从状态目录清理；参见配置中的 `OMO_HERDR_DAG_RETENTION_DAYS`。关闭提示仅在断开连接后显示；它不代表所有 workflow 任务都已成功完成。
+
+Snapshot 的所属进程消失后，清理会将其标记为断开连接并清除实时模型活动，同时保留最后报告的任务和 workflow 状态。显示连接丢失并不能证明工作已经取消或完成。
 
 ## 配置与本地数据
 
@@ -155,11 +155,17 @@ OmO 会话结束时，最后的图形仍保持可见，并带有断开连接的�
 
 Herdr 会向其 pane 提供 `HERDR_ENV`、`HERDR_PANE_ID` 和 `HERDR_SOCKET_PATH`。扩展还要求该 socket 路径存在，且能找到真实的 `herdr` 可执行文件（`HERDR_BIN_PATH` 为已存在的文件时用它，否则用 `PATH` 上的 `herdr`）。来自上一次 Herdr 会话的残留环境——包括以 `(deleted)` 结尾的 `HERDR_BIN_PATH`——不会激活 viewer。不要手动设置这些变量来定向另一个 pane。
 
+新的 `herdr-core` 路径使用受管理终端提供的 `HC_TERMINAL_ID` 与 `HC_TERMINAL_SOCKET`。它从 `PATH` 或 `~/.local/bin` 查找 `herdr-core`/`hc` 和 `herdr-app`；也可通过 `HC_BIN_PATH` 与 `HC_APP_BIN_PATH` 显式指定可执行文件。如果应用窗口尚未显示所属会话，则暂缓挂接，不会把 viewer 放到其他标签页。
+
 独立构建版本（如 `omob`）仍需要单独的 Node.js 24+ 安装来运行 viewer。扩展在打开 pane 前检查运行时，并解析实际的 Node 可执行文件，包括 `node` 是版本管理器 shim 的情况。它不会通过编译的 OmO 二进制启动 viewer。要显式指定 Node，请以 `OMO_HERDR_DAG_NODE=/absolute/path/to/node omob` 启动。显式路径无效时产生警告，而不是回退到其他运行时。
 
 Snapshot 是本地 JSON 文件，包含会话与运行 ID、名称、节点标签、状态、任务 ID、依赖边和错误消息。workflow 提示词不会写入，但标签和错误仍可能包含项目信息。请勿把运行时文件放进公开的 issue 报告或版本控制。本扩展不添加任何外部网络服务或遥测。
 
+Viewer 的启动与复用通过本机 loopback 端点以及绑定唯一启动 token、会话、状态文件和 pane/终端 ID 的确认记录来核验。仅有终端或存活的 PID 并不够。控制器会等待 viewer 就绪确认，在有时限的健康检查后，替换仍存在但 viewer 已丢失或身份不符的终端。若终端本身已消失，则本轮运行保持关闭：无法区分用户在应用中关闭与崩溃后被移除的情况，可通过 `/dag-pane` 或新的运行重新打开。按 `q` 会记录本次启动的主动关闭意图。这些检查仅在本机进行，不会将 workflow 内容发送到网络。
+
 任务详情通过任务 ID 关联到 workflow 节点。可用的任务描述、agent/模型信息、进度、时间戳和计数会显示在显式关联的子任务旁边，缺失的详情不做推测。子任务关系与 workflow 依赖是两回事；viewer 不会把依赖边变成父子链接。
+
+Workflow 节点保留 OmO DAG 报告的状态，关联任务详情则保留 worker 的任务状态。这两个来源可能暂时不同，不会为了使两者一致而静默覆盖。可按 `d` 对比同一任务 ID 及其报告的状态。Agent 的 TODO 清单是独立数据，不是此扩展的输入。
 
 进度是 OmO 提供的、当前工具在用时的最新助手摘录，而非完整记录。存储的进度限制为 512 字符，描述限制为 2000 字符；详情面板会对提供的文本换行。完整的任务提示词、输出和最终回复不会复制进这些 snapshot。
 
@@ -167,7 +173,7 @@ Snapshot 是本地 JSON 文件，包含会话与运行 ID、名称、节点标�
 
 ## 更新与卸载
 
-更新时再次运行 `npx omo-herdr-dag@latest install`。源码安装则获取新源码并重新运行安装程序。每次安装都会创建新的 generation 目录，因此 `/reload` 加载的是新的传递模块而不是缓存代码。先前的 generation 保留为备份；旧式平铺安装会被移到备份目录。重新安装还会删除由本安装程序创建的 `extensions/herdr-dag.js`。Senpi 会把已加载的 `herdr-*.js` 文件视为用户 Herdr reporter 并跳过其内置的 agent presence，因此入口文件是 `extensions/omo-herdr-dag.js`。运行时记录和语言会被保留。已安装副本独立于源码检出或 npm 缓存。之后在现有 OmO 会话中运行 `/reload`。现有 viewer 进程也需要重启以加载 UI 变更。
+要更新此 fork，请从 `marti-s/omo-herdr-dag` 所用分支获取新源码，再运行 `node scripts/install.mjs`。不要用上游 npm 的 `@latest` 安装程序更新此 fork。每次安装都会创建新的 generation 目录，因此 `/reload` 加载的是新的传递模块而不是缓存代码。先前的 generation 保留为备份；旧式平铺安装会被移到备份目录。重新安装还会删除由本安装程序创建的 `extensions/herdr-dag.js`。Senpi 会把已加载的 `herdr-*.js` 文件视为用户 Herdr reporter 并跳过其内置的 agent presence，因此入口文件是 `extensions/omo-herdr-dag.js`。运行时记录和语言会被保留。已安装副本独立于源码检出或 npm 缓存。之后在现有 OmO 会话中运行 `/reload`。仍运行旧代码的 viewer 应按 `q` 关闭，再用 `/dag-pane` 重新打开。
 
 卸载时，删除 `~/.omo/agent/extensions/omo-herdr-dag.js`。如果旧安装留下了 `extensions/herdr-dag.js` 也一并删除，然后重载或重启 OmO。已有的 DAG pane 请自行关闭。你可以保留 `~/.omo/agent/herdr-dag/` 作为记录，或单独删除。自定义安装则从相应 agent 目录删除入口文件。
 
@@ -175,7 +181,7 @@ Snapshot 是本地 JSON 文件，包含会话与运行 ID、名称、节点标�
 
 ### 这是 OmO 插件还是 Herdr 插件？
 
-它是一个 **OmO 扩展**。安装程序把它放进 OmO 的 agent 目录，在那里监听 workflow 更新。它使用 Herdr 普通的 `pane` 命令打开并管理 DAG viewer；不会向 Herdr 安装任何插件。
+它是一个 **OmO 扩展**。安装程序把它放进 OmO 的 agent 目录，在那里监听 workflow 更新。它通过 `herdr-core`/`herdr-app` 或旧版 `herdr pane` 命令管理 DAG viewer；不会向 Herdr 安装任何插件。
 
 ### Herdr 没装或我在 Herdr 之外启动 OmO 会怎样？
 
@@ -184,13 +190,14 @@ Snapshot 是本地 JSON 文件，包含会话与运行 ID、名称、节点标�
 | 未安装 Herdr | 可以安装扩展，但在普通终端中保持未激活。 |
 | 已安装 Herdr，但 OmO 运行在普通终端 | 扩展保持未激活，不注册 `/dag-pane`。仅打开 Herdr 应用是不够的。 |
 | OmO 运行在 Herdr pane 内 | 扩展激活，注册 `/dag-pane`，并在 workflow DAG 到达时打开 viewer。 |
-| 存在 Herdr 环境变量，但 socket 或 `herdr` 可执行文件缺失 | 扩展保持未激活，不注册 `/dag-pane`，也不尝试 pane 命令。 |
+| OmO 运行在 `herdr-core` 管理的终端内 | 通过 `HC_TERMINAL_*` 环境激活，待 `herdr-app` 显示所属会话后将 viewer 挂接到其标签页。 |
+| 存在旧版 Herdr 环境变量，但 socket 或 `herdr` 可执行文件缺失 | 扩展保持未激活，不注册 `/dag-pane`，也不尝试 pane 命令。 |
 
-激活需要 `HERDR_ENV=1`、非空的 `HERDR_PANE_ID` 和 `HERDR_SOCKET_PATH`、该路径上的活动 socket，以及可解析的 `herdr` 二进制。未激活的会话不会订阅 DAG 更新，也不会打开 viewer pane。要使用 viewer，请在 Herdr pane 中启动新的 OmO 会话，而不是手动设置这些变量。
+激活使用旧版 `HERDR_*` pane 环境与 `herdr`，或 `HC_TERMINAL_ID`、`HC_TERMINAL_SOCKET` 与 `herdr-core`/`hc`。对应 socket 必须存在。未激活的会话不会订阅 DAG 更新，也不会打开 viewer pane。请在受管理终端中启动 OmO，不要手动指定其他终端的标识。
 
 ### 必须在 Herdr 中把 OmO 注册为自定义 agent 吗？
 
-不必。在普通的 Herdr 终端 pane 中直接运行 `omo` 或 `omob` 即可。扩展使用 pane ID 和 CLI 命令，不需要 Herdr 的 agent 注册或侧边栏识别。全新、未修改的 Herdr 安装尚未完成端到端验证；测试范围见 [VERIFICATION.md](VERIFICATION.md)。
+不必。在 Herdr 管理的终端中直接运行 `omo` 或 `omob` 即可。扩展使用终端/pane ID 和 CLI 命令，不依赖 agent 注册或侧边栏识别。已测试的版本组合见 [VERIFICATION.md](VERIFICATION.md)；新的 `herdr-app` 恢复改动尚未在实际应用会话中验证。
 
 ## 故障排查
 
@@ -198,9 +205,11 @@ Snapshot 是本地 JSON 文件，包含会话与运行 ID、名称、节点标�
 | --- | --- |
 | `/dag-pane` 不可用 | 重载 OmO，确认扩展安装在生效的 agent 目录，并确认 OmO 运行在 Herdr 内。 |
 | 没有自动打开 pane | 扩展只针对 workflow DAG 或当前会话的 OmO 任务打开。没有 OmO 任务记录的普通 `parallel()` 调用不算任务。检查 OmO 版本和自定义任务存储路径；手动关闭的 pane 需要 `/dag-pane`。 |
-| pane 被关闭后不再打开 | 这是有意为之。运行 `/dag-pane` 重新打开。 |
+| pane 被关闭后不再打开 | 本轮运行有意保持关闭。可运行 `/dag-pane` 重新打开，新的运行也可打开 viewer。 |
 | `omob` 报 `Unknown options: --state, --close-pane` | 更新本扩展，关闭失败的 DAG pane，在 OmO 中运行 `/reload`，然后 `/dag-pane`。旧启动器把编译的 OmO 二进制误当成了 Node。 |
-| 出现 `DAG pane:` 警告 | 确认 `herdr` 在 `PATH` 上且支持 `pane split`、`get`、`rename` 和 `run`。启动失败或不确定时会抑制自动重试，以避免重复 pane。重试前请检查并关闭未完成的 viewer pane。 |
+| 出现 `DAG pane:` 警告 | 检查所用接口的可执行文件与 socket：`herdr-core`/`hc` 加 `herdr-app`，或旧版 `herdr pane`。启动需要收到匹配 viewer 的就绪确认。先检查未完成的 viewer，再用 `/dag-pane` 重试。 |
+| 恢复后的终端只显示 shell | 控制器会核验 viewer 身份，并可替换丢失的 viewer。可用 `/dag-pane` 显式重试；终端存在并不代表 viewer 已就绪。 |
+| 状态似乎已过期 | 等待两秒恢复检查，再按 `d` 对比图形和任务状态。检查任务存储配置与读取/监视诊断。刷新不能修正上游记录本身的过期状态。 |
 | 某条依赖边难以跟踪 | 查看每个节点内的 incoming ID 和图形下方的完整边列表。必要时滚动。 |
 
 ## 工作原理
@@ -217,7 +226,7 @@ OmO 任务进度: omo.task.updated + 本地任务记录
 
 普通子任务显示在独立的任务列表中，而不会被伪造成依赖节点。已链接到任何显示中 DAG 的任务会从该列表排除；其子任务仍归属于所属任务。只收集当前会话的任务及其显式关联的后代。
 
-桥接层监听已安装的 Senpi 事件总线。它使用 `herdr pane split --ratio 0.65 --no-focus`、`rename` 和 `run` 创建 viewer。Herdr 的 ratio 以原 pane 为基准，为新 pane 留下约 35% 的宽度。
+桥接层监听已安装的 Senpi 事件总线，并定期重读当前会话的任务记录与 checkpoint。`herdr-core` 适配器启动带标签的 viewer 终端，再通过 `herdr-app` 挂接到所属会话的标签页，保留 lane 布局与焦点。旧适配器使用 `herdr pane split --ratio 0.65 --no-focus`、`rename` 和 `run`，为新 pane 留下约 35% 的宽度。
 
 此集成依赖 OmO/Senpi 的内部事件契约，这些契约可能随版本变化。它读取显式的 workflow 边；不会推断无关任务之间的依赖。宽 frontier 会换行，跨越 frontier 的依赖通过 incoming ID 和边列表表示。长标签和错误会被裁剪到终端宽度。
 
@@ -235,9 +244,9 @@ GitHub Actions 在 Linux 的 Node 24 与 26 上运行这些检查，并上传 np
 
 ## 分发
 
-GitHub 托管源码和 CI 制品。npm registry 分发带版本的 CLI 与扩展包。安装程序把运行时文件复制到你的 OmO agent 目录并在本地运行；本项目不需要托管的应用服务器。下载的 CI tarball 可以用 `npm install -g ./omo-herdr-dag-1.0.0.tgz` 安装，然后运行 `omo-herdr-dag install`。
+此 fork 的源码和 CI 制品托管在 [marti-s/omo-herdr-dag](https://github.com/marti-s/omo-herdr-dag)。npm 包是单独的上游发行版，包版本不代表此 fork 已发布。安装程序把运行时文件复制到 OmO agent 目录并在本地运行。从此 fork 构建的 tarball 可用 `npm install -g ./omo-herdr-dag-1.7.0.tgz` 安装，再运行 `omo-herdr-dag install`。
 
-推送 `v1.0.0` 之类的版本 tag 会运行 **Release to GitHub and npm** 工作流：它在 Node 24 和 26 上测试，校验 tag 与包版本一致，然后发布已验证的包。它还会创建带自动生成说明和 `.tgz` 下载的 [GitHub Release](https://github.com/jc01rho/omo-herdr-dag/releases)。发布到 npm 前需先配置 npm 认证；GitHub Release 使用内置 token，可以独立成功。普通分支推送运行 CI；手动运行发布工作流会执行 dry run。预发布版本使用 npm 的 `next` tag。设置与发布步骤见 [RELEASING.md](RELEASING.md)。
+继承的 **Release to GitHub and npm** 工作流与源码安装相互独立。发布需要相应的仓库和 npm 配置；本次改动不会发布 release。普通分支推送运行 CI，手动运行发布工作流执行 dry run。从 fork 发布前请先阅读 [RELEASING.md](RELEASING.md)。
 
 欢迎贡献、兼容性报告和终端渲染的改进。提交更改前请先阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
 

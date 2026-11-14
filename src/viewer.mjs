@@ -5,6 +5,7 @@ import { createHc, createHerdr } from './herdr.mjs';
 import { t } from './i18n.mjs';
 import { renderFrame, runningTarget, standaloneTasks } from './render.mjs';
 import { readJson } from './storage.mjs';
+import { startViewerHealth } from './viewer-health.mjs';
 import { TASK_SCOPE, emptyViewState, isExpanded, loadViewState, saveViewState, setExpanded } from './view-state.mjs';
 
 const file = process.argv[process.argv.indexOf('--state') + 1];
@@ -12,7 +13,7 @@ if (!process.argv.includes('--state') || !file) throw new Error('Usage: node vie
 let state = await readJson(file);
 let selectedId = state?.runs?.[0]?.id;
 let view = state?.runs?.length ? 'dag' : 'tasks', selectedTaskId;
-let scroll = 0, error = '', timer, drawing = false, again = false;
+let scroll = 0, error = '', watchError = '', timer, watcher, drawing = false, again = false;
 let viewState = emptyViewState(state?.sessionId), viewError = '', saving = Promise.resolve(), closing = false;
 const selectedNodes = new Map();
 let revealSelection = false, verbose = false, detailSelection, completedExpanded = false;
@@ -31,10 +32,13 @@ function ownerGone() {
   catch (cause) { return cause.code === 'ESRCH'; }
 }
 const interactive = Boolean(process.stdout.isTTY && process.stdin.isTTY);
-function draw() {
+function draw({ inspect = false } = {}) {
   if (closing) return;
   if (state?.connected) target = runningTarget(state, target);
-  const running = follow && state?.connected ? target : undefined;
+  // Inspection gets its own frame without changing the person's Follow setting.
+  // The next model/snapshot/clock update resumes following unless f turned it off.
+  if (follow && !inspect) revealSelection = false;
+  const running = follow && !inspect && state?.connected ? target : undefined;
   if (running) {
     if (view !== running.view || running.view === 'dag' && selectedId !== running.runId) scroll = 0;
     view = running.view;
@@ -51,7 +55,7 @@ function draw() {
     view === 'tasks' ? selectedTaskId : selectedNodes.get(selectedId)]);
   if (selection !== detailSelection) { verbose = false; detailSelection = selection; }
   const result = renderFrame(state, { columns: process.stdout.columns ?? 54, rows: process.stdout.rows ?? 48, runIndex, scroll, color: interactive,
-    error, notice: viewError ? t(state?.language, 'viewError', { error: viewError }) : '', completedExpanded,
+    error: error || watchError, notice: viewError ? t(state?.language, 'viewError', { error: viewError }) : '', completedExpanded,
     selectedNodeId: selectedNodes.get(selectedId), selectedTaskId, view, viewState, verbose, revealSelection, follow,
     runningNodeId: running?.nodeId, runningTaskId: running?.taskId });
   scroll = result.scroll;
@@ -59,11 +63,13 @@ function draw() {
   process.stdout.write(interactive ? `\x1b[H${frame.replaceAll('\n', '\x1b[K\r\n')}\x1b[K` : `${frame}\n`);
 }
 async function refresh() {
+  if (closing) return;
   if (drawing) { again = true; return; }
   drawing = true;
   try {
     const next = await readJson(file);
     if (next) {
+      if (viewerToken && next.sessionId !== viewerSession) throw new Error('Viewer snapshot does not match its session');
       const sessionChanged = next.sessionId !== state?.sessionId;
       // A newly started run takes over the view while following, even before its first node runs.
       const newRun = follow && next.runs?.[0]?.id && next.runs[0].id !== state?.runs?.[0]?.id;
@@ -84,29 +90,57 @@ async function refresh() {
   if (again) { again = false; void refresh(); }
 }
 if (process.argv.includes('--once') || !interactive) { draw(); process.exit(0); }
+const argument = name => process.argv.includes(name) ? process.argv[process.argv.indexOf(name) + 1] : undefined;
+const viewerToken = argument('--viewer-token');
+const viewerSession = argument('--viewer-session') ?? state?.sessionId;
+if (viewerToken && state?.sessionId !== viewerSession) throw new Error('Viewer snapshot does not match its session');
+// A token-bound receipt proves this process loaded the intended snapshot, not just
+// that a shell command was accepted. Standalone and --once invocations need none.
+const health = viewerToken ? await startViewerHealth({ stateFile: file, sessionId: viewerSession,
+  paneId: argument('--close-pane') ?? process.env.HC_TERMINAL_ID, token: viewerToken }) : undefined;
 process.stdout.write('\x1b[?1049h\x1b[?25l\x1b]0;OmO DAG\x07');
 process.stdin.setRawMode(true);
 process.stdin.resume();
 process.stdin.setEncoding('utf8');
 emitKeypressEvents(process.stdin);
-const watcher = watch(dirname(file), (_event, name) => {
-  if (name && String(name) !== basename(file)) return;
-  clearTimeout(timer); timer = setTimeout(() => { void refresh(); }, 40);
-});
-watcher.on('error', cause => { error = cause.message; draw(); });
+function startWatcher() {
+  if (closing || watcher) return;
+  try {
+    const next = watch(dirname(file), (_event, name) => {
+      if (name && String(name) !== basename(file)) return;
+      clearTimeout(timer); timer = setTimeout(() => { void refresh(); }, 40);
+    });
+    watcher = next;
+    watchError = '';
+    next.on('error', cause => {
+      if (watcher !== next) return;
+      watchError = cause.message; watcher = undefined; next.close(); draw();
+    });
+    next.on('close', () => { if (watcher === next) watcher = undefined; });
+  } catch (cause) { watchError = cause.message; }
+}
+startWatcher();
 const resize = () => draw();
 process.stdout.on('resize', resize);
-// Advance only the display clock. Snapshot reads remain driven by fs.watch.
+// fs.watch is the fast path, not the only path: dropped events and failed watches
+// recover on a bounded interval. refresh() coalesces overlapping reads.
+const recovery = setInterval(() => { startWatcher(); void refresh(); }, 2000);
+recovery.unref();
+// Elapsed time can advance between snapshots; recovery independently rereads data.
 const clock = setInterval(() => {
   if (ownerGone()) return void close(true);
   if (state?.connected && (state.tasks?.some(task => task.status === 'running') ||
       state.runs?.some(run => run.nodes.some(node => node.state === 'running')))) draw();
 }, 1000);
-async function close(closePane = false) {
+async function close(closePane = false, intentional = false) {
   if (closing) return;
   closing = true;
-  clearTimeout(timer); clearInterval(clock); watcher.close(); process.stdout.off('resize', resize);
+  clearTimeout(timer); clearInterval(clock); clearInterval(recovery); watcher?.close(); process.stdout.off('resize', resize);
   await saving;
+  if (intentional) {
+    try { await health?.markClosing(); }
+    catch (cause) { process.stderr.write(`DAG pane: ${cause.message}\n`); }
+  }
   process.stdin.setRawMode(false);
   process.stdout.write('\x1b[?25h\x1b[?1049l');
   if (viewError) process.stderr.write(`${t(state?.language, 'viewError', { error: viewError })}\n`);
@@ -126,36 +160,35 @@ async function close(closePane = false) {
       if (!String(error.message).includes('pane_not_found')) process.stderr.write(`${t(state?.language, 'closeFailed', { error: error.message })}\n`);
     }
   }
+  try { await health?.close(); }
+  catch (cause) { process.stderr.write(`DAG pane: ${cause.message}\n`); }
   process.exit(0);
 }
 process.stdin.on('keypress', (text, pressed) => {
   if (closing) return;
   const key = !pressed.ctrl && !pressed.meta && !pressed.shift && ARROWS[pressed.name] || pressed.sequence || pressed.name || text;
-  if (key === 'q' || key === '\x03' || key === '\x04') return void close(true);
+  if (key === 'q' || key === '\x03' || key === '\x04') return void close(true, true);
   if (key === 'f') {
     follow = !follow; revealSelection = false;
     // Following again means the newest run, not the run that was followed before the person chose one.
     if (follow && state?.runs?.length) { target = undefined; selectedId = state.runs[0].id; view = 'dag'; scroll = 0; }
   }
   if (['\x1b[B', 'j', '\x1b[A', 'k', '\x1b[6~', '\x1b[5~'].includes(key)) {
-    follow = false; revealSelection = false;
+    revealSelection = false;
   }
   if (key === '\x1b[B' || key === 'j') scroll++;
   if (key === '\x1b[A' || key === 'k') scroll = Math.max(0, scroll - 1);
   if (key === '\x1b[6~') scroll += Math.max(1, (process.stdout.rows ?? 48) - 8);
   if (key === '\x1b[5~') scroll = Math.max(0, scroll - Math.max(1, (process.stdout.rows ?? 48) - 8));
   if (key === 't' && state?.runs?.length) {
-    follow = false;
     view = view === 'dag' ? 'tasks' : 'dag';
     scroll = 0; revealSelection = true;
   }
   if ((key === 'c' || pressed.name === 'c') && (state?.runs?.length ?? 0) > 1) {
-    follow = false;
     completedExpanded = !completedExpanded;
     scroll = 0; revealSelection = true;
   }
   if (key === '\x1b[C' || key === '\x1b[D') {
-    follow = false;
     // Every run of the session, completed ones included; the header shows which one of how many.
     const runs = state?.runs ?? [];
     const current = Math.max(0, runs.findIndex(run => run.id === selectedId));
@@ -168,7 +201,6 @@ process.stdin.on('keypress', (text, pressed) => {
   const scope = view === 'tasks' ? TASK_SCOPE : run?.id;
   const itemId = view === 'tasks' ? selectedTaskId : selectedNodes.get(selectedId);
   if (items.length && (pressed.name === 'tab' || key === 'n' || key === 'p')) {
-    follow = false;
     const current = Math.max(0, items.findIndex(item => item.id === itemId));
     const direction = pressed.shift || key === 'p' ? -1 : 1;
     const nextId = items[(current + direction + items.length) % items.length].id;
@@ -177,13 +209,11 @@ process.stdin.on('keypress', (text, pressed) => {
     revealSelection = true;
   }
   if (items.length && key === 'd') {
-    follow = false;
     // A temporary detail peek never writes or replaces the saved fold state.
     verbose = !verbose;
     revealSelection = true;
   }
   if (items.length && (key === ' ' || key === '\r' || key === '\n')) {
-    follow = false;
     verbose = false;
     const item = items.find(item => item.id === itemId);
     const status = view === 'tasks' ? item.status : item.state;
@@ -196,7 +226,7 @@ process.stdin.on('keypress', (text, pressed) => {
     });
     revealSelection = true;
   }
-  draw();
+  draw({ inspect: key !== 'f' });
 });
 process.on('SIGTERM', () => { void close(); }); process.on('SIGINT', () => { void close(); }); process.on('SIGHUP', () => { void close(); });
 draw();
