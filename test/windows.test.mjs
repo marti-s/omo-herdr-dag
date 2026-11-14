@@ -15,9 +15,15 @@ for (const suffix of ['plain space ', "owner's space "]) {
     const viewer = join(directory, 'viewer.mjs');
     await writeFile(viewer, 'console.log(JSON.stringify(process.argv.slice(2)));');
     const paneId = 'test:p2';
-    let output;
+    let output, confirmed;
     const pane = new DagPane({ sessionId: 'test', parentPane: 'test:p1', socket: 'test',
       stateDir: directory, cwd: directory, node: process.execPath, viewer,
+      // This shell-quoting probe prints argv and exits; live readiness is covered
+      // by the real viewer PTY tests. Check that its launch identity is preserved.
+      health: { probe: async () => ({ status: 'running' }), wait: async expected => {
+        confirmed = expected;
+        return { status: 'running' };
+      } },
       herdr: async (action, ...args) => {
         if (action === 'split') return { pane: { pane_id: paneId } };
         if (action === 'run') {
@@ -33,7 +39,9 @@ for (const suffix of ['plain space ', "owner's space "]) {
     // When the real controller opens its viewer, execute the actual run command.
     await pane.open();
     // Then the shell preserves the viewer argv, including apostrophes.
-    assert.deepEqual(JSON.parse(output), ['--state', pane.stateFile, '--close-pane', paneId]);
+    assert.deepEqual(JSON.parse(output), ['--state', pane.stateFile, '--close-pane', paneId,
+      '--viewer-session', 'test', '--viewer-token', confirmed.token]);
+    assert.deepEqual(confirmed, { stateFile: pane.stateFile, sessionId: 'test', paneId, token: confirmed.token });
   });
 }
 

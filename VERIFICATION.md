@@ -61,6 +61,16 @@ The viewer requires Node 24 or later. On this host the pane shell's `node` was 2
 
 The scripted checks in `scripts/verify-native.mjs` could not be used on this host. Both paths fail against OmO 5.0.1 / Senpi 2026.9.27 **identically on untouched `v1.4.0`**: the non-live path at line 59, before any state file exists, and the live path at line 79 with zero pane records — while the same installed extension works through the real OmO path described above. As this document notes, those source assertions are bound to the beta.42 bundle. Its `OMO_PACKAGE_ROOT` layout also expects `<root>/node_modules/@code-yeongyu/senpi` and `<root>/plugin` in one directory, which a hoisted npm/Bun installation does not provide; pointing it at a directory of symlinks to both real locations is what let it reach the assertions at all.
 
+## Fork viewer recovery verification (2026-11-14)
+
+The recovery changes in `marti-s/omo-herdr-dag` were checked on Linux x86_64 with Node 24.22.1. The full `npm run check` pipeline passed: 186 tests with no skips or failures, the syntax-checking build, and offline installation of the actual npm tarball. The packaged runtime includes the viewer identity helper and still has no runtime npm dependencies.
+
+Coverage includes real loopback sockets for launch identity and readiness, bounded startup with dropped watch notifications, recovery of an existing terminal after its viewer endpoint dies, and real PTY tests for snapshot watch loss/recreation, Follow controls, manual closure, and signal shutdown. Controller tests exercise delayed task and DAG updates, durable checkpoint recovery without an RPC, preserved task freshness across reload, startup failure followed by reconciliation and explicit retry, and ownership checks that leave the parent and other sessions' terminals untouched. Mocked `hc`/`herdr-app` commands cover placement, lane naming, focus preservation, and duplicate cleanup.
+
+These checks did not run an installed OmO/Senpi session or a live `herdr-app` window. They establish local behavior and packaging, not end-to-end compatibility with a particular installed app version. Native macOS and Windows were not rerun for this change; the historical results above remain limited to their recorded versions.
+
+An absent terminal is intentionally left closed for its current run because external app closure cannot be distinguished from removal after a crash. Use `/dag-pane` or a new run to reopen it. Automatic recovery replaces a still-existing terminal only after its viewer fails the identity check. Task status and DAG node state remain separately reported facts, and owner loss marks a snapshot disconnected without inventing a cancellation or completion.
+
 ## Current limits
 
 The earlier release baseline passed 20 behavior tests. Version 1.1.0 extends that coverage as described above. The package smoke check installs the actual tarball offline and verifies CLI execution, language selection and persistence, installer dry-run, extension imports, updates, and the MIT notice. These checks do not replace the live compatibility limits below.

@@ -1,4 +1,4 @@
-import { watch, existsSync } from 'node:fs';
+import { watch, statSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
 import { clean } from './model.mjs';
@@ -24,11 +24,14 @@ export function normalizeTask(raw) {
   const tool = text(live?.current_tool, 128);
   const line = text(live?.last_assistant_line, 512);
   const progress = [tool ? `[${tool}]` : undefined, line].filter(Boolean).join(' ');
+  // A terminal endpoint can order a completion even when updated_at is absent
+  // or invalid. Persist that fallback so a reload preserves the same ordering.
+  const updatedAt = iso(raw.updated_at) ?? (terminal.has(raw.status) ? iso(raw.terminal_at) : undefined);
   const values = { id: raw.task_id,
     description: text(raw.description) ?? text(raw.task_summary) ?? text(raw.name),
     agent: text(raw.agent_type, 128) ?? text(raw.category, 128),
     model: text(raw.resolved_model?.display, 256) ?? text(raw.model, 256),
-    status: text(raw.status, 64), startedAt: iso(live?.started_at) ?? iso(raw.created_at),
+    status: text(raw.status, 64), updatedAt, startedAt: iso(live?.started_at) ?? iso(raw.created_at),
     completedAt: iso(raw.terminal_at) ?? (terminal.has(raw.status) ? iso(raw.updated_at) : undefined),
     progress: terminal.has(raw.status) ? undefined : text(progress, 512) ?? text(live?.activity, 512),
     turns: count(live?.turns) ?? count(stats?.turns), toolCalls: count(live?.tool_calls) ?? count(stats?.tool_calls) };
@@ -48,11 +51,11 @@ export class TaskData {
   restore(tasks = []) {
     for (const raw of tasks) {
       const task = normalizeTask({ task_id: raw.id, description: raw.description, agent_type: raw.agent,
-        model: raw.model, status: raw.status, created_at: raw.startedAt, terminal_at: raw.completedAt,
+        model: raw.model, status: raw.status, updated_at: raw.updatedAt, created_at: raw.startedAt, terminal_at: raw.completedAt,
         live_progress: { activity: raw.progress, turns: raw.turns, tool_calls: raw.toolCalls } });
       if (!task) continue;
       this.entries.set(task.id, { task, parentSessionId: taskId(raw.parentTaskId) ? undefined : this.sessionId,
-        ...(task.completedAt ? { updatedAt: task.completedAt } : {}),
+        ...((task.updatedAt ?? task.completedAt) ? { updatedAt: task.updatedAt ?? task.completedAt } : {}),
         ...(taskId(raw.parentTaskId) ? { parentTaskId: raw.parentTaskId } : {}) });
     }
   }
@@ -62,8 +65,16 @@ export class TaskData {
     if (!task || typeof parentSessionId !== 'string') return;
     const previous = this.entries.get(task.id);
     if (previous?.parentSessionId && previous.parentSessionId !== parentSessionId) return;
-    const updatedAt = iso(raw.updated_at);
+    const updatedAt = task.updatedAt;
     if (previous?.updatedAt && updatedAt && updatedAt < previous.updatedAt) return;
+    // A conflicting status with no usable timestamp cannot supersede dated
+    // evidence. Same-status metadata updates and wholly undated tasks still merge.
+    if (previous?.updatedAt && !updatedAt && previous.task.status && task.status &&
+        task.status !== previous.task.status) return;
+    // A delayed or undated running snapshot cannot reopen a completed attempt.
+    // Resumption is legitimate only when its timestamp advances the known state.
+    if (terminal.has(previous?.task.status) && task.status && !terminal.has(task.status) &&
+        (!updatedAt || (previous.updatedAt && updatedAt <= previous.updatedAt))) return;
     const merged = { ...previous?.task, ...task };
     if (terminal.has(merged.status)) {
       delete merged.progress;
@@ -86,6 +97,12 @@ export class TaskData {
   }
 
   async refresh(runs) {
+    // The controller periodically reconciles the store as a fallback for missed
+    // filesystem events. Use that opportunity to recover a failed/replaced watch.
+    if (this.watching && !this.stopped) {
+      try { this.armWatcher(); }
+      catch (error) { this.notify(`DAG pane: Task watcher: ${error.message}`); }
+    }
     let files;
     try { files = await readdir(this.directory); }
     catch (error) { if (error.code !== 'ENOENT') throw error; files = []; }
@@ -124,23 +141,46 @@ export class TaskData {
   }
 
   start() {
+    this.watching = true;
     this.armWatcher();
   }
 
   armWatcher() {
     if (this.stopped) return;
     let directory = this.directory;
-    while (!existsSync(directory) && dirname(directory) !== directory) directory = dirname(directory);
-    if (directory === this.watchedDirectory) return;
+    let identity;
+    for (;;) {
+      try {
+        const stats = statSync(directory);
+        if (stats.isDirectory()) { identity = `${stats.dev}:${stats.ino}`; break; }
+      } catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error; }
+      const parent = dirname(directory);
+      if (parent === directory) throw new Error(`No task watch directory exists for ${this.directory}`);
+      directory = parent;
+    }
+    if (this.watcher && directory === this.watchedDirectory && identity === this.watchedIdentity) return;
     this.watcher?.close();
-    this.watchedDirectory = directory;
+    this.watcher = undefined;
+    this.watchedDirectory = undefined;
+    this.watchedIdentity = undefined;
     const next = relative(directory, this.directory).split(/[\\/]/)[0];
-    this.watcher = watch(directory, { persistent: false }, (_event, filename) => {
-      if (this.stopped || (next && filename && String(filename) !== next)) return;
+    const watcher = watch(directory, { persistent: false }, (_event, filename) => {
+      if (this.stopped || this.watcher !== watcher || (next && filename && String(filename) !== next)) return;
       try { this.armWatcher(); this.onChange(); }
       catch (error) { this.notify(`DAG pane: Task watcher: ${error.message}`); }
     });
-    this.watcher.on('error', error => this.notify(`DAG pane: Task watcher: ${error.message}`));
+    this.watcher = watcher;
+    this.watchedDirectory = directory;
+    this.watchedIdentity = identity;
+    watcher.on('error', error => {
+      if (this.stopped || this.watcher !== watcher) return;
+      watcher.close();
+      this.watcher = undefined;
+      this.watchedDirectory = undefined;
+      this.watchedIdentity = undefined;
+      this.notify(`DAG pane: Task watcher: ${error.message}`);
+      this.onChange();
+    });
     // mkdir can create the next component between existsSync and watch. Subscribe
     // before checking again so that a newly created task directory cannot be missed.
     this.armWatcher();
@@ -148,8 +188,10 @@ export class TaskData {
 
   stop() {
     this.stopped = true;
+    this.watching = false;
     this.watcher?.close();
     this.watcher = undefined;
     this.watchedDirectory = undefined;
+    this.watchedIdentity = undefined;
   }
 }

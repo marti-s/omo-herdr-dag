@@ -10,6 +10,7 @@ import { readJson, writeJson } from '../src/storage.mjs';
 import { payload, sessionId } from './fixtures.mjs';
 import { normalizeRun } from '../src/model.mjs';
 import { messages } from '../src/i18n.mjs';
+import { probeViewerHealth, startViewerHealth, waitForViewerHealth } from '../src/viewer-health.mjs';
 
 async function setup(t) {
   const stateDir = await mkdtemp(join(tmpdir(), 'omo-dag-test-'));
@@ -35,7 +36,8 @@ async function setup(t) {
     return {};
   };
   const options = { sessionId, parentPane: 'test:p0', socket: '/tmp/test.sock', stateDir,
-    cwd: "/tmp/project with ' quotes", node: '/usr/bin/node', viewer: '/tmp/viewer.mjs', herdr };
+    cwd: "/tmp/project with ' quotes", node: '/usr/bin/node', viewer: '/tmp/viewer.mjs', herdr,
+    health: { probe: async ({ paneId }) => ({ status: panes.has(paneId) ? 'running' : 'unhealthy' }), wait: async () => {} } };
   const controller = new DagPane(options);
   controllers.add(controller);
   return { calls, panes, options, controller, controllers };
@@ -169,8 +171,8 @@ for (const trigger of ['start', 'rpc', 'disk']) {
     const saved = new EventEmitter();
     const save = controller.save.bind(controller);
     // Observe completion of the real save/activation path, without replacing it.
-    controller.save = async connected => {
-      const result = await save(connected);
+    controller.save = async (...args) => {
+      const result = await save(...args);
       for (const task of controller.tasks) saved.emit(`${task.id}:${task.status}`);
       return result;
     };
@@ -355,7 +357,10 @@ function coreHerdr() {
   const herdr = Object.assign(async (command, ...args) => {
     calls.push([command, ...args]);
     if (command === 'list') return { panes: [...viewers].map(([pane_id, session]) => ({ pane_id, session, label: dagTitle(session) })) };
-    if (command === 'get') { if (!viewers.has(args[0])) throw new Error('pane_not_found'); return { address: args[0], state: 'live' }; }
+    if (command === 'get') {
+      if (!viewers.has(args[0])) throw new Error('pane_not_found');
+      return { address: args[0], state: 'live', labels: { 'omo.dag': 'viewer', 'omo.dag.session': viewers.get(args[0]) } };
+    }
     if (command === 'close') { if (!viewers.delete(args[0])) throw new Error('pane_not_found'); return {}; }
     throw new Error(`unsupported ${command}`);
   }, { launch: async options => { calls.push(['launch', options]); const address = `t${++number}`; viewers.set(address, options.sessionId); return address; } });
@@ -364,9 +369,11 @@ function coreHerdr() {
 async function coreSetup(t) {
   const base = await setup(t);
   const fake = coreHerdr();
-  const controller = new DagPane({ ...base.options, herdr: fake.herdr });
+  const options = { ...base.options, herdr: fake.herdr,
+    health: { probe: async ({ paneId }) => ({ status: fake.viewers.has(paneId) ? 'running' : 'unhealthy' }), wait: async () => {} } };
+  const controller = new DagPane(options);
   base.controllers.add(controller);
-  return { ...base, ...fake, controller };
+  return { ...base, ...fake, options, controller };
 }
 // Same 8-char prefix as the fixture session: only the full id tells them apart.
 const otherSession = `${sessionId}-other`;
@@ -381,10 +388,13 @@ test('herdr-core: repeated updates launch one labelled viewer and record the own
   await Promise.all(Array.from({ length: 8 }, () => controller.receive(payload())));
   await controller.receive(payload());
   assert.equal(launches().length, 1);
+  const record = await readJson(controller.recordFile);
+  assert.match(record.token, /^[0-9a-f-]{36}$/);
   assert.deepEqual(launches()[0][1], { parent: options.parentPane, sessionId, cwd: options.cwd,
-    argv: [options.node, options.viewer, '--state', controller.stateFile, '--owner-pid', String(process.pid)] });
+    argv: [options.node, options.viewer, '--state', controller.stateFile, '--owner-pid', String(process.pid),
+      '--viewer-session', sessionId, '--viewer-token', record.token] });
   assert.deepEqual((await readJson(controller.stateFile)).owner, { pid: process.pid });
-  assert.deepEqual(await readJson(controller.recordFile), { paneId: 't1', ready: true, runId: 'dag_demo' });
+  assert.deepEqual(record, { paneId: 't1', ready: true, attempted: true, runId: 'dag_demo', token: record.token });
 });
 
 test('herdr-core: duplicates of the same session close, other sessions stay untouched', async t => {
@@ -436,7 +446,7 @@ test('start reconciles stale snapshots of dead sessions before restoring', async
   await controller.start();
   const state = await readJson(stale);
   assert.equal(state.connected, false);
-  assert.equal(state.runs[0].status, 'cancelled');
+  assert.equal(state.runs[0].status, 'running');
 });
 
 test('herdr-core: a session the window does not show yet is retried with back-off, never in a guessed tab', async t => {
@@ -498,4 +508,210 @@ test('herdr-core: a forced open says why while the window does not show the sess
   assert.deepEqual(notes, []);
   await controller.open();
   assert.deepEqual(notes, [messages.en.notShown]);
+});
+
+test('herdr-core: a restored shell is replaced only after its viewer endpoint fails, then acknowledged', { timeout: 5000 }, async t => {
+  const { controller, herdr, viewers, calls, launches } = await coreSetup(t);
+  let clock = 0;
+  controller.now = () => clock;
+  controller.health = { probe: probeViewerHealth, wait: waitForViewerHealth };
+  const endpoints = [];
+  t.after(async () => { for (const endpoint of endpoints) await endpoint.close(); });
+  const launch = herdr.launch;
+  herdr.launch = async options => {
+    const paneId = await launch(options);
+    const token = options.argv[options.argv.indexOf('--viewer-token') + 1];
+    endpoints.push(await startViewerHealth({ stateFile: controller.stateFile, sessionId, paneId, token }));
+    return paneId;
+  };
+  await controller.receive(payload());
+  const first = await readJson(controller.recordFile);
+  assert.equal(first.ready, true);
+  assert.equal((await probeViewerHealth(controller.viewerIdentity(first))).status, 'running');
+  await endpoints[0].close(); // Terminal still exists, but it is now just a restored shell.
+  const settledCalls = calls.length;
+  await controller.receive(payload());
+  assert.equal(calls.length, settledCalls, 'streamed updates use the bounded health cache');
+  clock = 5001;
+  await controller.refresh();
+  const replacement = await readJson(controller.recordFile);
+  assert.equal(launches().length, 2);
+  assert.notEqual(replacement.token, first.token);
+  assert.equal(replacement.ready, true);
+  assert.deepEqual([...viewers.keys()], ['t2']);
+  assert.equal((await probeViewerHealth(controller.viewerIdentity(replacement))).status, 'running');
+  await controller.refresh();
+  assert.equal(launches().length, 2, 'the confirmed replacement is reused');
+});
+
+for (const [backend, prepare] of [['legacy', setup], ['herdr-core', coreSetup]]) {
+  test(`${backend}: readiness failure stays unready and a forced retry replaces the pending terminal`, async t => {
+    const { controller, calls } = await prepare(t);
+    const launchCount = () => calls.filter(call => ['split', 'launch'].includes(call[0])).length;
+    let fail = true, attempts = 0;
+    controller.health.wait = async identity => {
+      attempts++;
+      const pending = await readJson(controller.recordFile);
+      assert.equal(pending.ready, false, 'a successful terminal launch is not viewer readiness');
+      assert.equal(pending.token, identity.token);
+      if (fail) throw Object.assign(new Error('Viewer did not confirm startup'), { code: 'VIEWER_START_TIMEOUT' });
+    };
+    await assert.rejects(controller.receive(payload()), { code: 'VIEWER_START_TIMEOUT' });
+    const first = await readJson(controller.recordFile);
+    assert.equal(first.ready, false);
+    await controller.receive(payload());
+    await controller.refresh();
+    assert.equal(launchCount(), 1);
+    assert.equal(attempts, 1);
+    fail = false;
+    await controller.open();
+    const second = await readJson(controller.recordFile);
+    assert.equal(second.ready, true);
+    assert.notEqual(second.token, first.token);
+    assert.ok(calls.some(call => call[0] === 'close' && call[1] === first.paneId));
+    assert.equal(launchCount(), 2);
+  });
+}
+
+for (const status of ['closing', 'closed']) {
+  test(`herdr-core: a ${status} receipt suppresses same-run recovery while the terminal still exists`, async t => {
+    const { controller, launches, viewers } = await coreSetup(t);
+    await controller.receive(payload());
+    controller.healthInterval = 0;
+    controller.health.probe = async () => ({ status });
+    await controller.refresh();
+    assert.equal((await readJson(controller.recordFile)).closed, true);
+    assert.deepEqual([...viewers.keys()], ['t1']);
+    await controller.receive(payload());
+    assert.equal(launches().length, 1);
+    await controller.receive(withNewerRun());
+    assert.equal(launches().length, 2, 'a new run may replace the intentionally closed viewer');
+    assert.deepEqual([...viewers.keys()], ['t2']);
+  });
+}
+
+test('herdr-core: stale foreign and parent records cannot be reused or closed, even during stop', async t => {
+  for (const paneId of ['t-foreign', 'test:p0']) {
+    const { controller, viewers, calls } = await coreSetup(t);
+    viewers.set(paneId, otherSession);
+    await writeJson(controller.recordFile, { paneId, ready: true, runId: 'dag_demo' });
+    await assert.rejects(controller.receive(payload()), /does not belong|parent terminal/);
+    await controller.stop();
+    assert.equal(viewers.get(paneId), otherSession);
+    assert.ok(!calls.some(call => call[0] === 'close' && call[1] === paneId));
+    assert.ok(!calls.some(call => call[0] === 'launch'));
+  }
+});
+
+test('herdr-core: an old terminal that cannot close prevents a duplicate launch', async t => {
+  const { controller, herdr, viewers, launches } = await coreSetup(t);
+  await controller.receive(payload());
+  controller.healthInterval = 0;
+  controller.health.probe = async () => ({ status: 'unhealthy' });
+  controller.herdr = Object.assign(async (command, ...args) => {
+    if (command === 'close') throw new Error('terminal still running');
+    return herdr(command, ...args);
+  }, { launch: herdr.launch });
+  await assert.rejects(controller.refresh(), /terminal still running/);
+  await controller.receive(payload());
+  assert.equal(launches().length, 1);
+  assert.deepEqual([...viewers.keys()], ['t1']);
+});
+
+test('task events refresh durable DAG status without inferring node completion from child completion', async t => {
+  const { controller, checkpoint, checkpointFile } = await checkpointSetup(t);
+  const running = { ...checkpoint, status: 'running', updatedAt: '2026-09-06T01:30:00Z',
+    nodes: checkpoint.nodes.map(node => ({ ...node, state: 'running' })) };
+  await writeJson(checkpointFile, running);
+  await controller.start();
+  let state = await readJson(controller.stateFile);
+  assert.equal(state.runs[0].nodes[0].state, 'running');
+  assert.equal(state.tasks[0].status, 'completed', 'node and child task retain their separately reported states');
+  await writeJson(checkpointFile, checkpoint);
+  await controller.receiveTasks({ parent_session_id: sessionId, tasks: [] });
+  state = await readJson(controller.stateFile);
+  assert.equal(state.runs[0].status, 'completed', 'the newer checkpoint is picked up without a DAG RPC');
+  await controller.receive({ parent_session_id: sessionId, runs: [running] });
+  await writeJson(checkpointFile, running);
+  await controller.refresh();
+  assert.equal((await readJson(controller.stateFile)).runs[0].status, 'completed', 'neither stale RPC nor stale disk rolls it back');
+});
+
+test('periodic checkpoint recovery survives a failed first launch, avoids idle writes and stops cleanly', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const { controller, checkpoint, checkpointFile, calls } = await checkpointSetup(t);
+  let fail = true;
+  controller.health.wait = async () => { if (fail) throw new Error('startup timeout'); };
+  await assert.rejects(controller.start(), /startup timeout/);
+  const saved = await readJson(controller.stateFile);
+  const next = { ...checkpoint, updatedAt: '2026-09-06T02:00:00Z', name: 'Recovered without any event' };
+  await writeJson(checkpointFile, next);
+  t.mock.timers.tick(2000);
+  await controller.queue;
+  assert.equal((await readJson(controller.stateFile)).runs[0].name, next.name);
+  assert.equal(calls.filter(call => call[0] === 'split').length, 1, 'failed startup is not retried by polling');
+  const current = await readJson(controller.stateFile);
+  assert.notDeepEqual(current.runs, saved.runs);
+  t.mock.timers.tick(2000);
+  await controller.queue;
+  assert.deepEqual(await readJson(controller.stateFile), current, 'unchanged stores do not rewrite snapshots');
+  fail = false;
+  await controller.open();
+  assert.equal((await readJson(controller.recordFile)).ready, true);
+  await controller.stop();
+  const disconnected = await readJson(controller.stateFile);
+  await writeJson(checkpointFile, { ...next, updatedAt: '2026-09-06T03:00:00Z', name: 'After stop' });
+  t.mock.timers.tick(4000);
+  await controller.queue;
+  assert.deepEqual(await readJson(controller.stateFile), disconnected);
+});
+
+test('a task notification during a refresh gets a follow-up pass instead of waiting for the fallback timer', async t => {
+  const { controller } = await setup(t);
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  let reads = 0;
+  controller.restoreRuns = async () => {
+    if (++reads === 1) { entered.resolve(); await release.promise; }
+  };
+  const first = controller.refresh();
+  await entered.promise;
+  assert.equal(controller.refresh(), first, 'overlapping refresh callers share one operation');
+  release.resolve();
+  await first;
+  assert.equal(reads, 2, 'a change during the first pass is reread before resolving');
+});
+
+for (const timestamp of ['2026-09-06T02:00:00Z', '']) {
+  test(`terminal DAG outcomes survive delayed same-attempt events with ${timestamp ? 'equal' : 'unknown'} timestamps`, async t => {
+    const { controller, checkpoint, checkpointFile } = await checkpointSetup(t);
+    const finished = { ...checkpoint, updatedAt: timestamp };
+    await writeJson(checkpointFile, finished);
+    await controller.start();
+    const delayed = { ...finished, status: 'running', nodes: finished.nodes.map(node => ({ ...node, state: 'running' })) };
+    await controller.receive({ parent_session_id: sessionId, runs: [delayed] });
+    await controller.refresh();
+    assert.deepEqual((await readJson(controller.stateFile)).runs, [normalizeRun(finished)]);
+    const resumed = { ...delayed, nodes: delayed.nodes.map(node => ({ ...node, attempt: node.attempt + 1 })) };
+    await controller.receive({ parent_session_id: sessionId, runs: [resumed] });
+    await controller.refresh();
+    assert.deepEqual((await readJson(controller.stateFile)).runs, [normalizeRun(resumed)],
+      'a higher attempt resumes and cannot be overwritten by an older-attempt checkpoint');
+  });
+}
+
+test('terminal node evidence advances an undated checkpoint but cannot roll back within the same attempt', async t => {
+  const { controller, checkpoint, checkpointFile } = await checkpointSetup(t);
+  const running = { ...checkpoint, status: 'running', updatedAt: '', nodes: checkpoint.nodes.map(node => ({ ...node, state: 'running' })) };
+  await writeJson(checkpointFile, running);
+  await controller.start();
+  const progress = { ...running, nodes: running.nodes.map((node, i) => i ? node : { ...node, state: 'completed' }) };
+  await writeJson(checkpointFile, progress);
+  await controller.refresh();
+  assert.equal((await readJson(controller.stateFile)).runs[0].nodes[0].state, 'completed');
+  await controller.receive({ parent_session_id: sessionId, runs: [running] });
+  assert.equal((await readJson(controller.stateFile)).runs[0].nodes[0].state, 'completed');
+  const resumed = { ...running, updatedAt: '2026-09-06T03:00:00Z' };
+  await controller.receive({ parent_session_id: sessionId, runs: [resumed] });
+  await controller.refresh();
+  assert.deepEqual((await readJson(controller.stateFile)).runs, [normalizeRun(resumed)], 'a genuinely newer update can resume');
 });

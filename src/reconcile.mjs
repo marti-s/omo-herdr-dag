@@ -3,8 +3,6 @@ import { join } from 'node:path';
 import { readJson, writeJson } from './storage.mjs';
 
 const STALE_MS = 6 * 60 * 60 * 1000;
-// The renderer has no 'interrupted' style; 'cancelled' is the closest status it already draws.
-const INTERRUPTED = 'cancelled';
 
 function processAlive(pid) {
   try { process.kill(pid, 0); return true; }
@@ -12,8 +10,8 @@ function processAlive(pid) {
   catch (error) { return error.code !== 'ESRCH'; }
 }
 
-// A state file whose owning session died still says connected/running; mark it
-// disconnected and interrupt its running work so viewers stop showing it live.
+// Owner loss is evidence that this display is disconnected, not that OmO
+// cancelled the underlying work. Retain the last reported workflow/task states.
 export async function reconcileStaleState(stateDir, { alive = processAlive, now = Date.now() } = {}) {
   let files;
   try { files = await readdir(stateDir); }
@@ -28,10 +26,8 @@ export async function reconcileStaleState(stateDir, { alive = processAlive, now 
       const stale = Number.isInteger(pid) ? !alive(pid)
         : !state.owner && !(now - Date.parse(state.updatedAt) < STALE_MS);
       if (!stale) continue;
-      const runs = (state.runs ?? []).map(run => ({ ...run,
-        ...(run.status === 'running' ? { status: INTERRUPTED } : {}),
-        nodes: (run.nodes ?? []).map(node => node.state === 'running' ? { ...node, state: INTERRUPTED } : node) }));
-      await writeJson(join(stateDir, file), { ...state, connected: false, runs });
+      const tasks = state.tasks?.map(({ activity: _activity, ...task }) => task);
+      await writeJson(join(stateDir, file), { ...state, connected: false, ...(tasks ? { tasks } : {}) });
       reconciled.push(file);
     } catch (error) { errors.push({ file, error }); }
   }

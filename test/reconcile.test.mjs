@@ -11,12 +11,15 @@ const hoursAgo = hours => new Date(now - hours * 3600e3).toISOString();
 const runs = () => [{ id: 'run', status: 'running', nodes: [{ id: 'a', state: 'completed' }, { id: 'b', state: 'running' }] },
   { id: 'done', status: 'completed', nodes: [{ id: 'c', state: 'completed' }] }];
 
-test('reconcile interrupts dead-owner and old ownerless snapshots and leaves live ones', async t => {
+test('reconcile disconnects dead-owner and old ownerless snapshots without inventing workflow outcomes', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'omo-dag-reconcile-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const files = {
-    dead: { connected: true, owner: { pid: 2222 }, updatedAt: hoursAgo(0), runs: runs() },
-    old: { connected: true, updatedAt: hoursAgo(7), runs: runs() },
+    dead: { connected: true, owner: { pid: 2222 }, updatedAt: hoursAgo(0), runs: runs(),
+      tasks: [{ id: 'st_running', status: 'running', progress: 'Last reported work', activity: { phase: 'thinking' } },
+        { id: 'st_completed', status: 'completed', completedAt: hoursAgo(1) }] },
+    old: { connected: true, updatedAt: hoursAgo(7), runs: runs(),
+      tasks: [{ id: 'st_running', status: 'running', activity: { phase: 'tool', tool: 'bash' } }] },
     fresh: { connected: true, updatedAt: hoursAgo(1), runs: runs() },
     live: { connected: true, owner: { pid: 1111 }, updatedAt: hoursAgo(48), runs: runs() },
     disconnected: { connected: false, owner: { pid: 2222 }, updatedAt: hoursAgo(48), runs: runs() },
@@ -30,8 +33,8 @@ test('reconcile interrupts dead-owner and old ownerless snapshots and leaves liv
   for (const name of ['dead', 'old']) {
     const state = await readJson(join(dir, `${name}.json`));
     assert.equal(state.connected, false);
-    assert.deepEqual(state.runs.map(run => run.status), ['cancelled', 'completed']);
-    assert.deepEqual(state.runs[0].nodes.map(node => node.state), ['completed', 'cancelled']);
+    assert.deepEqual(state.runs, files[name].runs);
+    assert.deepEqual(state.tasks, files[name].tasks.map(({ activity: _activity, ...task }) => task));
     assert.equal(state.updatedAt, files[name].updatedAt);
   }
   for (const name of ['fresh', 'live', 'disconnected', 'key.pane', 'key.json.view'])

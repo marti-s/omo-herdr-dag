@@ -1,16 +1,19 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
 import { messages } from '../src/i18n.mjs';
 import { width } from '../src/render.mjs';
 import { writeJson } from '../src/storage.mjs';
 import { TASK_SCOPE } from '../src/view-state.mjs';
+import { probeViewerHealth, viewerIntentFile } from '../src/viewer-health.mjs';
 
 test('real standalone PTY respects saved folds, preserves task selection, switches mixed views and persists', { timeout: 25000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'tasks-pty-'));
@@ -28,6 +31,7 @@ test('real standalone PTY respects saved folds, preserves task selection, switch
   const fresh = await viewer.frame(text => text.includes('> ● [+] FIRST_DESCRIPTION'));
   assert.equal(fresh.split('\n').filter(line => line.startsWith('│')).length, 2);
   assert.doesNotMatch(fresh, /FIRST_PROGRESS|REAL_MODEL|EXPLICIT_CHILD/);
+  await viewer.frame(text => text.includes(messages.ko.followOff), () => viewer.send({ keys: 'f' }));
   await viewer.frame(text => text.includes('FIRST_PROGRESS'), () => viewer.send({ keys: 'd' }));
   const foldedAgain = await viewer.frame(text => text.includes('> ● [+] FIRST_DESCRIPTION'), () => viewer.send({ keys: 'd' }));
   assert.doesNotMatch(foldedAgain, /FIRST_PROGRESS|EXPLICIT_CHILD/);
@@ -350,6 +354,7 @@ test('real viewer PTY selects, toggles, refreshes, switches runs and persists ac
   const fresh = await viewer.frame(text => text.includes('FIRST_RUN'));
   assert.match(fresh, /> \[[-+]\] ALPHA/);
   assert.ok(fresh.includes('[+] BETA'));
+  await viewer.frame(text => text.includes(messages.en.followOff), () => viewer.send({ keys: 'f' }));
   await viewer.frame(text => text.split('\n').length === 60, () => viewer.send({ resize: [60, 80] }));
   await viewer.frame(text => text.includes('> ● ALPHA_DESCRIPTION') && text.includes('ALPHA_PROGRESS'), () => viewer.send({ keys: ' ' }));
   await viewer.frame(text => text.includes('> ○ [+] BETA_DESCRIPTION'), () => viewer.send({ keys: '\t' }));
@@ -400,7 +405,7 @@ test('real viewer PTY selects, toggles, refreshes, switches runs and persists ac
   console.log('PTY evidence: saved false folded, saved true restored, Tab/Shift-Tab/n/p, Space/Enter, run switches, atomic refresh/reorder/retry/new node, quit/restart persistence passed.');
 });
 
-test('real viewer follows newly active runs and manual run selection survives later arrivals', { timeout: 25000 }, async t => {
+test('real viewer follows newly active runs and explicitly paused run selection survives later arrivals', { timeout: 25000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dag-follow-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const file = join(dir, 'session.json');
@@ -418,6 +423,7 @@ test('real viewer follows newly active runs and manual run selection survives la
   state.tasks.push({ id: 'st_new', status: 'running', description: 'NEW_TASK' });
   const followed = await viewer.frame(text => text.includes('Selected run: NEW_RUN') && text.includes(messages.en.followOn), () => writeJson(file, state));
   assert.ok(followed.includes('NEW_NODE'));
+  await viewer.frame(text => text.includes('Selected run: NEW_RUN') && text.includes(messages.en.followOff), () => viewer.send({ keys: 'f' }));
   await viewer.frame(text => text.includes('Selected run: NEW_RUN') && text.includes(messages.en.followOff), () => viewer.send({ keys: 'c' }));
   await viewer.frame(text => text.includes('Selected run: OLD_RUN') && text.includes(messages.en.followOff), () => viewer.send({ keys: '\x1b[C' }));
   state.runs.unshift({ id: 'r-later', name: 'LATER_RUN', status: 'running', nodes: [
@@ -425,10 +431,10 @@ test('real viewer follows newly active runs and manual run selection survives la
   ], edges: [] });
   await viewer.frame(text => text.includes('LATER_RUN') && text.includes('Selected run: OLD_RUN'), () => writeJson(file, state));
   await viewer.close();
-  console.log('PTY evidence: new run auto-followed once; manual run selection pins the pane across later arrivals.');
+  console.log('PTY evidence: new run auto-followed once; explicitly paused run selection stays pinned across later arrivals.');
 });
 
-test('real PTY follow reveals graph work, retains parallel targets, hands off and suspends for every inspection control', { timeout: 45000 }, async t => {
+test('real PTY follow stays enabled through every inspection control and resumes on the next snapshot', { timeout: 45000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dag-target-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const file = join(dir, 'session.json');
@@ -468,19 +474,19 @@ test('real PTY follow reveals graph work, retains parallel targets, hands off an
   await viewer.frame(text => text.split('\n').length === 26, () => viewer.send({ resize: [26, 80] }));
   const controls = ['j', 'k', '\x1b[6~', '\x1b[5~', 'n', 'p', '\t', '\x1b[Z', ' ', '\r', 'd', '\x1b[C', '\x1b[D', 'c', 't'];
   for (const [index, keys] of controls.entries()) {
-    await viewer.frame(text => text.includes(messages.en.followOff), () => viewer.send({ keys }));
+    await viewer.frame(text => text.includes(messages.en.followOn), () => viewer.send({ keys }));
     run.name = `INSPECTION_${index}`;
     state.runs[1].name = `OTHER_INSPECTION_${index}`;
     state.tasks.find(task => task.id === 'root').description = `ROOT_UPDATE_${index}`;
-    const inspected = await viewer.frame(text => text.includes(messages.en.followOff) &&
-      (text.includes(`Selected run: ${run.name}`) || text.includes(`Selected run: ${state.runs[1].name}`) ||
-        text.includes(`ROOT_UPDATE_${index}`)), () => writeJson(file, state));
-    assert.ok(inspected.includes(messages.en.followOff));
-    const resumed = await viewer.frame(text => text.includes(messages.en.followOn) && text.includes('NEXT_TARGET_') &&
-      !text.includes('DETAIL_n7'), () => viewer.send({ keys: 'f' }));
+    const resumed = await viewer.frame(text => text.includes(messages.en.followOn) &&
+      text.includes(`Selected run: ${run.name}`) && text.includes('NEXT_TARGET_') &&
+      !text.includes('DETAIL_n7'), () => writeJson(file, state));
     assert.doesNotMatch(resumed, /> \[-\] NEXT_TARGET/);
   }
   await viewer.frame(text => text.includes(messages.en.followOff), () => viewer.send({ keys: 'f' }));
+  run.name = 'EXPLICITLY_PAUSED';
+  await viewer.frame(text => text.includes('EXPLICITLY_PAUSED') && text.includes(messages.en.followOff), () => writeJson(file, state));
+  await viewer.frame(text => text.includes(messages.en.followOff), () => viewer.send({ keys: 'd' }));
   await viewer.frame(text => text.includes(messages.en.followOn) && text.includes('NEXT_TARGET_'), () => viewer.send({ keys: 'f' }));
   await viewer.close();
   assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), state);
@@ -585,6 +591,7 @@ test('left and right step through every run in both CSI and application-cursor f
   const viewer = openViewer(file, t);
   const shows = (name, index, count) => text => text.includes(`Selected run: ${name}_RUN · Run ${index} of ${count}`);
   await viewer.frame(shows('R1', 1, 3));
+  await viewer.frame(text => text.includes(messages.en.followOff), () => viewer.send({ keys: 'f' }));
   // Completed runs are reachable without expanding them first; SS3 and CSI arrows act alike.
   await viewer.frame(text => shows('R2', 2, 3)(text) && text.includes(messages.en.followOff), () => viewer.send({ keys: '\x1bOC' }));
   // Shift-right is not a run step: with it counted, this would wrap to run 1.
@@ -611,6 +618,7 @@ test('real viewer clock advances elapsed without new snapshots or input', { time
   await writeJson(file, state);
   const viewer = openViewer(file, t);
   await viewer.frame(text => text.includes('CLOCK_RUN'));
+  await viewer.frame(text => text.includes(messages.en.followOff), () => viewer.send({ keys: 'f' }));
   const seconds = text => {
     const duration = text.match(new RegExp(`${messages.en.elapsed}: (\\d+):(\\d{2}):(\\d{2})`));
     return duration ? Number(duration[1]) * 3600 + Number(duration[2]) * 60 + Number(duration[3]) : -1;
@@ -628,4 +636,93 @@ test('real viewer clock advances elapsed without new snapshots or input', { time
   await viewer.frame(text => seconds(text) === 9, () => viewer.send({ keys: 'n' }));
   await viewer.close();
   console.log('PTY clock evidence: two elapsed advances without snapshots/input; completed duration frozen at 00:00:09.');
+});
+
+for (const mode of ['dropped', 'failed']) test(`real viewer recovers ${mode} snapshot watch notifications without input`, { timeout: 15000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dag-watch-recovery-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'session.json'), log = join(dir, 'watch.log'), preload = join(dir, 'watch-fault.mjs');
+  // Fault-inject only the child process's fs.watch. Record reads as a startup
+  // barrier so the replacement cannot be rescued by the initial catch-up read.
+  await writeFile(preload, `import fs from 'node:fs';
+import promises from 'node:fs/promises';
+import { EventEmitter } from 'node:events';
+import { syncBuiltinESMExports } from 'node:module';
+const watch = fs.watch, read = promises.readFile;
+let watches = 0;
+fs.watch = function (...args) {
+  fs.appendFileSync(${JSON.stringify(log)}, 'watch\\n');
+  if (${JSON.stringify(mode)} === 'failed' && ++watches > 1) return watch.apply(this, args);
+  const watcher = new EventEmitter();
+  watcher.close = () => watcher.emit('close');
+  if (${JSON.stringify(mode)} === 'failed') setImmediate(() => watcher.emit('error', new Error('WATCH_TEST_FAILURE')));
+  return watcher;
+};
+promises.readFile = async function (path, ...args) {
+  const value = await read.call(this, path, ...args);
+  if (String(path) === ${JSON.stringify(file)}) fs.appendFileSync(${JSON.stringify(log)}, 'read\\n');
+  return value;
+};
+syncBuiltinESMExports();
+`);
+  const state = { sessionId: 'watch-recovery', connected: true, runs: [], tasks: [
+    { id: 'task', status: 'completed', description: 'BEFORE_RECOVERY' },
+  ] };
+  await writeJson(file, state);
+  const env = isolatedEnv({ NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import=${pathToFileURL(preload).href}`].filter(Boolean).join(' ') });
+  const viewer = openViewer(file, t, [], env);
+  await viewer.frame(text => text.includes('BEFORE_RECOVERY'));
+  const deadline = Date.now() + 3000;
+  while ((await readFile(log, 'utf8')).split('\n').filter(line => line === 'read').length < 2) {
+    assert.ok(Date.now() < deadline, 'initial snapshot catch-up read finished');
+    await delay(20);
+  }
+  state.tasks[0].description = 'AFTER_RECOVERY';
+  const recovered = await viewer.frame(text => text.includes('AFTER_RECOVERY'), () => writeJson(file, state));
+  assert.doesNotMatch(recovered, /WATCH_TEST_FAILURE/);
+  if (mode === 'failed') {
+    assert.ok((await readFile(log, 'utf8')).split('\n').filter(line => line === 'watch').length >= 2,
+      'failed directory watcher was recreated');
+    state.tasks[0].description = 'WATCHING_AGAIN';
+    await viewer.frame(text => text.includes('WATCHING_AGAIN'), () => writeJson(file, state));
+  }
+  await viewer.close();
+});
+
+test('real viewer confirms its launch identity and records explicit close before closing its own pane', { timeout: 15000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dag-viewer-ready-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'session.json'), log = join(dir, 'calls.jsonl'), hc = join(dir, 'herdr-core');
+  const expected = { stateFile: file, sessionId: 'ready-session', paneId: 'own-viewer', token: randomUUID() };
+  const intent = viewerIntentFile(expected);
+  await writeJson(file, { sessionId: expected.sessionId, connected: true, runs: [], tasks: [
+    { id: 'task', status: 'completed', description: 'READY_TASK' },
+  ] });
+  await writeFile(hc, `#!${process.execPath}\nconst fs = require('node:fs');\nconst [command, , address] = process.argv.slice(2);\n` +
+    `const intent = JSON.parse(fs.readFileSync(${JSON.stringify(intent)}, 'utf8'));\n` +
+    `fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ command, status: intent.status }) + '\\n');\n` +
+    `console.log(JSON.stringify(command === 'get' ? { address, state: 'live', labels: { 'omo.dag': 'viewer', 'omo.dag.session': 'ready-session' } } : {}));\n`);
+  await chmod(hc, 0o755);
+  const viewer = openViewer(file, t, ['--viewer-token', expected.token, '--viewer-session', expected.sessionId],
+    isolatedEnv({ HC_TERMINAL_ID: expected.paneId, HC_BIN_PATH: hc }));
+  await viewer.frame(text => text.includes('READY_TASK'));
+  const ready = await probeViewerHealth(expected);
+  assert.equal(ready.status, 'running');
+  assert.equal(ready.receipt.sessionId, expected.sessionId);
+  await viewer.close();
+  const calls = (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.ok(calls.some(call => call.command === 'kill'));
+  assert.ok(calls.every(call => call.status === 'closing'), 'manual intent was persisted before the backend could terminate the viewer');
+  assert.equal((await probeViewerHealth(expected)).status, 'closed');
+  const replacement = { ...expected, token: randomUUID() };
+  const signalled = openViewer(file, t, ['--viewer-token', replacement.token, '--viewer-session', replacement.sessionId],
+    isolatedEnv({ HC_TERMINAL_ID: replacement.paneId }));
+  await signalled.frame(text => text.includes('READY_TASK'));
+  const running = await probeViewerHealth(replacement);
+  assert.equal(running.status, 'running');
+  const exited = once(signalled.child, 'exit', { signal: AbortSignal.timeout(5000) });
+  process.kill(running.receipt.pid, 'SIGTERM');
+  await exited;
+  assert.equal((await probeViewerHealth(replacement)).status, 'unhealthy');
+  await assert.rejects(readFile(viewerIntentFile(replacement)), { code: 'ENOENT' });
 });
